@@ -1,0 +1,3 @@
+- insert:
+    - id: solgrid
+      name: '@solgridai/dsh-plugin'

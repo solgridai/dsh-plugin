@@ -1,0 +1,84 @@
+{
+  "name": "@solgridai/dsh-plugin",
+  "version": "0.1.0",
+  "description": "Discover and run Solgrid third-party tools and creative skills (social media data, image & video generation, and more) in DeepSeek Harness — zero setup.",
+  "author": "Solgrid",
+  "license": "MIT",
+  "homepage": "https://solgrid.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/solgridai/dsh-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/solgridai/dsh-plugin/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "solgrid",
+    "agent",
+    "tools",
+    "skills"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "docs/*.md",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.0 <0.3.0",
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.js",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@solgridai/cli": "^0.5.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-skill": ">=0.0.1-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
+    "@deepseek-ai/dsh-working-directory": ">=0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-working-directory": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-skill": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-working-directory": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
