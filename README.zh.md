@@ -11,11 +11,11 @@
 ### 在 DSH Web / Desktop 界面安装
 
 1. 打开侧边栏 **Plugins（插件）** 页面。
-2. 点击 **安装**，输入包名：
+2. 点击 **添加插件（Add plugin）**，输入包名：
    ```text
    @solgridai/dsh-plugin
    ```
-3. 确认安装即可热加载生效。
+3. 点击 **安装（Install）** 确认，即可热加载生效。
 
 ### 通过 DSH CLI 安装
 

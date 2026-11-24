@@ -11,11 +11,11 @@ It embeds [`@solgridai/cli`](https://www.npmjs.com/package/@solgridai/cli) and r
 ### From the DSH Web / Desktop UI
 
 1. Open **Plugins** in the sidebar.
-2. Click **Install** and enter:
+2. Click **Add plugin**, enter the package name:
    ```text
    @solgridai/dsh-plugin
    ```
-3. Confirm installation. The plugin activates immediately.
+3. Click **Install** to confirm. The plugin activates immediately.
 
 ### From the DSH CLI
 
