@@ -144,6 +144,12 @@ describe('buildCliEnv', () => {
     assert.equal(env.SOLGRID_LANG, 'zh')
     assert.equal(env.ELECTRON_RUN_AS_NODE, '1')
     assert.equal(env.NO_COLOR, '1')
+    assert.equal(env.SOLGRID_NO_UPDATE_CHECK, '1')
+  })
+
+  it('respects explicit SOLGRID_NO_UPDATE_CHECK from base env', () => {
+    const env = buildCliEnv({}, { SOLGRID_NO_UPDATE_CHECK: '' })
+    assert.equal(env.SOLGRID_NO_UPDATE_CHECK, '')
   })
 
   it('applies explicit config overrides above inherited env', () => {

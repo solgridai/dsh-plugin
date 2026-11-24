@@ -30,6 +30,8 @@ const SIGKILL_GRACE_MS = 2_000
 const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use the built-in \`solgrid\` tool instead of running \`solgrid\` through \`bash\`. Pass CLI arguments as the \`args\` array (for example \`{ "args": ["discover", "-q", "twitter user profile", "--json"] }\`). The CLI is bundled with this plugin, so no separate installation is needed.
 >
 > For device-code login, call \`solgrid\` with \`{ "args": ["login", "--json"] }\`: it returns the authorization link and code immediately while polling in the background. Relay the link and code to the user; once they approve in their browser, run \`{ "args": ["whoami", "--json"] }\` or re-run the command that failed.
+>
+> To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
 
 `
 
@@ -175,7 +177,12 @@ export function isLoginCommand(args) {
  */
 export function buildCliEnv(config, baseEnv = process.env) {
   /** @type {NodeJS.ProcessEnv} */
-  const env = { ...baseEnv, ELECTRON_RUN_AS_NODE: '1', NO_COLOR: '1' }
+  const env = {
+    ...baseEnv,
+    ELECTRON_RUN_AS_NODE: '1',
+    NO_COLOR: '1',
+    SOLGRID_NO_UPDATE_CHECK: baseEnv.SOLGRID_NO_UPDATE_CHECK ?? '1',
+  }
   const apiBaseUrl = typeof config.apiBaseUrl === 'string' ? config.apiBaseUrl.trim() : ''
   if (apiBaseUrl) env.SOLGRID_API_BASE_URL = apiBaseUrl
   if (config.lang === 'en' || config.lang === 'zh') env.SOLGRID_LANG = config.lang
