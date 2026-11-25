@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -26,10 +27,39 @@ const DEFAULT_TIMEOUT_MS = 300_000
 const DEFAULT_LOGIN_BANNER_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_OUTPUT_CHARS = 200_000
 const SIGKILL_GRACE_MS = 2_000
+/** Mirrors the CLI's own default for a bare `--wait` flag. */
+const DEFAULT_WAIT_SECONDS = 300
+/** Extra headroom above a declared `--wait` budget so the CLI's own WAIT_TIMEOUT fires first. */
+const WAIT_GRACE_MS = 15_000
+/** Options that consume the following token as their value; scanned to avoid misreading values as flags. */
+const VALUE_OPTIONS = new Set([
+  '--lang',
+  '-i',
+  '--input',
+  '-f',
+  '--input-file',
+  '--query',
+  '--path',
+  '-p',
+  '--provider',
+  '-e',
+  '--endpoint',
+  '-o',
+  '--output',
+  '--skill',
+  '--idempotency-key',
+  '-r',
+  '--run-id',
+  '-l',
+  '--limit',
+  '--cursor',
+])
 
 const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use the built-in \`solgrid\` tool instead of running \`solgrid\` through \`bash\`. Pass CLI arguments as the \`args\` array (for example \`{ "args": ["discover", "-q", "twitter user profile", "--json"] }\`). The CLI is bundled with this plugin, so no separate installation is needed.
 >
 > For device-code login, call \`solgrid\` with \`{ "args": ["login", "--json"] }\`: it returns the authorization link and code immediately while polling in the background. Relay the link and code to the user; once they approve in their browser, run \`{ "args": ["whoami", "--json"] }\` or re-run the command that failed.
+>
+> Timeouts on paid runs: every \`run\` gets an \`--idempotency-key\` injected automatically, and the tool extends its own timeout to cover a declared \`--wait\` budget, so the CLI itself can report \`WAIT_TIMEOUT\` with the run ID and key. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
 >
 > To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
 
@@ -58,6 +88,7 @@ const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use t
  * @property {number} exitCode
  * @property {string} stdout
  * @property {string} stderr
+ * @property {string} [hint] WAIT_TIMEOUT-style recovery notice attached when a run is cut off by the tool timeout.
  */
 
 /** Cordis plugin name. */
@@ -82,7 +113,10 @@ export const Config = z.object({
     .number()
     .min(1_000)
     .default(DEFAULT_TIMEOUT_MS)
-    .description('Default command timeout in milliseconds (default: 300000).'),
+    .description(
+      'Safety-net subprocess timeout in milliseconds (default: 300000). Commands declaring `--wait <seconds>` ' +
+        'automatically get at least that long plus a grace margin, so the CLI reports its own WAIT_TIMEOUT first.',
+    ),
   loginBannerTimeoutMs: z
     .number()
     .min(1_000)
@@ -148,6 +182,25 @@ export function parseSkillMarkdown(raw) {
 }
 
 /**
+ * Return the first positional token (the CLI subcommand), skipping global options such as `--lang zh`.
+ * @param {readonly string[]} args
+ * @returns {string | undefined}
+ */
+export function firstPositionalCommand(args) {
+  if (!Array.isArray(args)) return undefined
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '--lang') {
+      i++ // skip the option value
+      continue
+    }
+    if (token.startsWith('-')) continue
+    return token
+  }
+  return undefined
+}
+
+/**
  * Return true when CLI arguments invoke the interactive `login` flow (excluding `--help`).
  * Handles global options such as `--lang zh login --json` or `--lang=zh login`.
  * @param {readonly string[]} args
@@ -156,16 +209,155 @@ export function parseSkillMarkdown(raw) {
 export function isLoginCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
   if (args.includes('--help') || args.includes('-h')) return false
+  return firstPositionalCommand(args) === 'login'
+}
+
+/**
+ * Return true when CLI arguments invoke the paid `run` command (excluding `--help`).
+ * @param {readonly string[]} args
+ * @returns {boolean}
+ */
+export function isRunCommand(args) {
+  if (!Array.isArray(args) || args.length === 0) return false
+  if (args.includes('--help') || args.includes('-h')) return false
+  return firstPositionalCommand(args) === 'run'
+}
+
+/**
+ * Extract an explicit `--idempotency-key <key>` / `--idempotency-key=<key>` value, if present.
+ * Values of other known options are skipped so JSON inputs cannot be misread as flags.
+ * @param {readonly string[]} args
+ * @returns {string | undefined}
+ */
+export function extractIdempotencyKey(args) {
+  if (!Array.isArray(args)) return undefined
   for (let i = 0; i < args.length; i++) {
     const token = args[i]
-    if (token === '--lang') {
-      i++ // skip the option value
-      continue
+    if (token === '--idempotency-key') {
+      const value = args[i + 1]
+      return typeof value === 'string' && value !== '' ? value : undefined
     }
-    if (token.startsWith('-')) continue
-    return token === 'login'
+    if (token.startsWith('--idempotency-key=')) {
+      const value = token.slice('--idempotency-key='.length)
+      return value !== '' ? value : undefined
+    }
+    if (VALUE_OPTIONS.has(token)) i++ // skip the option value
+  }
+  return undefined
+}
+
+/**
+ * Extract the declared `--wait` budget in seconds (default 300 for a bare `--wait`), if any.
+ * Handles `--wait 30`, `--wait=30`, `-w 30`, `-w=30`, and `-w30`.
+ * @param {readonly string[]} args
+ * @returns {number | undefined}
+ */
+export function extractWaitSeconds(args) {
+  if (!Array.isArray(args)) return undefined
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '--wait' || token === '-w') {
+      const next = args[i + 1]
+      return typeof next === 'string' && /^\d+$/.test(next) ? Number(next) : DEFAULT_WAIT_SECONDS
+    }
+    if (token.startsWith('--wait=')) {
+      const value = Number(token.slice('--wait='.length))
+      return Number.isFinite(value) && value >= 1 ? value : DEFAULT_WAIT_SECONDS
+    }
+    const short = token.match(/^-w=?(-?\d+)$/)
+    if (short) return Number(short[1])
+    if (VALUE_OPTIONS.has(token)) i++ // skip the option value
+  }
+  return undefined
+}
+
+/**
+ * Return true when the arguments contain an output-file option (`-o`/`--output`), which implies `--wait`.
+ * @param {readonly string[]} args
+ * @returns {boolean}
+ */
+export function hasOutputOption(args) {
+  if (!Array.isArray(args)) return false
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '-o' || token === '--output' || token.startsWith('--output=')) return true
+    if (VALUE_OPTIONS.has(token)) i++
   }
   return false
+}
+
+/**
+ * Prepare CLI arguments for execution: for `run` commands without an explicit key, append a freshly
+ * generated `--idempotency-key` so a tool-level timeout can still point at the exact run (the CLI's
+ * own generated key lives only in the child's memory and dies with it). Also reports the effective
+ * wait budget (declared, or implied by `-o`).
+ * @param {readonly string[]} args
+ * @returns {{ cliArgs: readonly string[], idempotencyKey: string | undefined, waitSeconds: number | undefined }}
+ */
+export function prepareRunInvocation(args) {
+  const waitSeconds = extractWaitSeconds(args)
+  if (!isRunCommand(args)) return { cliArgs: args, idempotencyKey: undefined, waitSeconds }
+  const existing = extractIdempotencyKey(args)
+  if (existing !== undefined) return { cliArgs: args, idempotencyKey: existing, waitSeconds }
+  const idempotencyKey = randomUUID()
+  return {
+    cliArgs: [...args, '--idempotency-key', idempotencyKey],
+    idempotencyKey,
+    waitSeconds: waitSeconds ?? (hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined),
+  }
+}
+
+/**
+ * Compute the effective subprocess timeout: never below the requested value, but extended to cover a
+ * declared `--wait` budget plus a grace margin, so the CLI's own WAIT_TIMEOUT (with run ID, key and
+ * recovery hints) is returned instead of a hard kill.
+ * @param {number} requestedMs
+ * @param {number | undefined} waitSeconds
+ * @returns {number}
+ */
+export function resolveTimeoutMs(requestedMs, waitSeconds) {
+  if (waitSeconds === undefined) return requestedMs
+  return Math.max(requestedMs, waitSeconds * 1000 + WAIT_GRACE_MS)
+}
+
+/**
+ * Best-effort extraction of a run ID from partial CLI output (JSON `"runId"` field or text-mode `Run ID:` line).
+ * @param {string} output
+ * @returns {string | undefined}
+ */
+export function extractRunId(output) {
+  if (!output) return undefined
+  const json = output.match(/"runId"\s*:\s*"([^"]+)"/)
+  if (json) return json[1]
+  const text = output.match(/Run ID:?\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)
+  return text ? text[1] : undefined
+}
+
+/**
+ * Build a WAIT_TIMEOUT-style recovery notice for a `run` cut off by the tool-level timeout,
+ * mirroring the CLI's own error contract (idempotency key, run ID, follow-up commands).
+ * @param {{ timeoutMs: number, idempotencyKey: string | undefined, runId?: string | undefined }} info
+ * @returns {string | undefined}
+ */
+export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
+  if (idempotencyKey === undefined && runId === undefined) return undefined
+  const seconds = Math.max(1, Math.round(timeoutMs / 1000))
+  /** @type {string[]} */
+  const lines = [
+    `WAIT_TIMEOUT: the solgrid tool stopped the CLI after ~${seconds}s, before it could report the outcome.`,
+    'The run may still be running (or already finished) on Solgrid and may be billed. Do not resubmit it with a new idempotency key.',
+  ]
+  if (runId !== undefined) {
+    lines.push(`runId: ${runId}`, `Check it with: solgrid runs get -r ${runId} --wait --json`)
+  }
+  if (idempotencyKey !== undefined) {
+    lines.push(
+      `idempotencyKey: ${idempotencyKey}`,
+      `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
+      `Or retry the same run safely by adding: --idempotency-key ${idempotencyKey}`,
+    )
+  }
+  return lines.join('\n')
 }
 
 /**
@@ -288,9 +480,10 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
    * @param {string} cwd
    * @param {number} timeoutMs
    * @param {AbortSignal} signal
+   * @param {string} [idempotencyKey] present when the invocation is a paid `run`; enables the WAIT_TIMEOUT recovery notice
    * @returns {Promise<CliRunResult>}
    */
-  const runCli = (cliArgs, cwd, timeoutMs, signal) =>
+  const runCli = (cliArgs, cwd, timeoutMs, signal, idempotencyKey) =>
     new Promise((resolve, reject) => {
       if (signal.aborted) {
         reject(createAbortError(signal, 'solgrid command aborted'))
@@ -348,11 +541,16 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       })
       child.on('error', (err) => fail(err))
       child.on('close', (code) => {
+        const hint =
+          timedOut && idempotencyKey !== undefined
+            ? buildTimeoutNotice({ timeoutMs, idempotencyKey, runId: extractRunId(stdout) })
+            : undefined
         finish({
           status: timedOut ? 'timeout' : code === 0 ? 'ok' : 'error',
           exitCode: code ?? 1,
           stdout: stdout.trimEnd(),
           stderr: stderr.trimEnd(),
+          ...(hint !== undefined ? { hint } : {}),
         })
       })
     })
@@ -472,7 +670,10 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
         timeoutMs: {
           type: 'integer',
           description:
-            `Optional positive timeout in milliseconds (defaults to ${defaultTimeoutMs}). Ignored for \`login\`, which returns the code immediately and polls in the background.`,
+            `Optional positive timeout in milliseconds (defaults to ${defaultTimeoutMs}). Treated as a lower bound for ` +
+            'commands with `--wait <seconds>`: the effective timeout is extended to cover the wait plus a margin, ' +
+            'so the CLI can return its own WAIT_TIMEOUT with the run ID and idempotency key. Ignored for `login`, ' +
+            'which returns the code immediately and polls in the background.',
         },
       },
       output: {
@@ -484,6 +685,11 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
             exitCode: { type: 'integer', required: true },
             stdout: { type: 'string', required: true },
             stderr: { type: 'string', required: true },
+            hint: {
+              type: 'string',
+              description:
+                'Recovery notice present when a paid `run` was cut off by the tool timeout: names the idempotency key (and run ID when known) with follow-up commands.',
+            },
           },
         },
         render: (_args, value) => {
@@ -503,6 +709,7 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
           }
           if (value.stdout) parts.push(value.stdout)
           if (value.stderr) parts.push(`stderr:\n${value.stderr}`)
+          if (value.hint) parts.push(value.hint)
           return [{ type: 'text', text: parts.join('\n') || '(no output)' }]
         },
       },
@@ -523,8 +730,9 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
         if (isLoginCommand(args.args)) {
           return await startLogin(args.args, cwd, exec.signal)
         }
-        const timeoutMs = args.timeoutMs ?? defaultTimeoutMs
-        return await runCli(args.args, cwd, timeoutMs, exec.signal)
+        const { cliArgs, idempotencyKey, waitSeconds } = prepareRunInvocation(args.args)
+        const timeoutMs = resolveTimeoutMs(args.timeoutMs ?? defaultTimeoutMs, waitSeconds)
+        return await runCli(cliArgs, cwd, timeoutMs, exec.signal, idempotencyKey)
       },
       presentCall: (args) => ({
         card: 'generic',

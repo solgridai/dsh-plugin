@@ -52,9 +52,15 @@ You can also configure the plugin in your profile's `cordis.patch.yml`:
   config:
     apiBaseUrl: https://api.solgrid.ai   # optional API base URL override
     lang: en                             # optional: "en" or "zh"
-    defaultTimeoutMs: 300000             # optional command timeout in ms (default: 300000)
+    defaultTimeoutMs: 300000             # optional safety-net subprocess timeout in ms (default: 300000)
     maxOutputChars: 200000               # optional stdout/stderr truncation cap (default: 200000)
 ```
+
+Timeouts are layered so paid runs are never lost to a hard kill:
+
+- Commands declaring `--wait <seconds>` (including the wait implied by `-o <file>`) always receive at least that long plus a grace margin, so the CLI reports its own `WAIT_TIMEOUT` — run ID, idempotency key and recovery commands included — before the tool timeout applies.
+- Every `run` gets an `--idempotency-key` injected automatically (unless you pass one), so even a residual hard timeout returns a recovery hint: `solgrid runs get --idempotency-key <key> --wait --json` fetches the run, and re-running with the same key never double-bills.
+- `defaultTimeoutMs` / the tool's `timeoutMs` remain as a safety net against hung processes (downloads, network stalls).
 
 ## Development
 

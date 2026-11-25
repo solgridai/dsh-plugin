@@ -8,9 +8,18 @@ import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import {
   applyWithCli,
   buildCliEnv,
+  buildTimeoutNotice,
   createAbortError,
+  extractIdempotencyKey,
+  extractRunId,
+  extractWaitSeconds,
+  firstPositionalCommand,
+  hasOutputOption,
   isLoginCommand,
+  isRunCommand,
   parseSkillMarkdown,
+  prepareRunInvocation,
+  resolveTimeoutMs,
 } from '../index.js'
 
 const mockCliPath = fileURLToPath(new URL('./fixtures/mock-cli.js', import.meta.url))
@@ -131,6 +140,102 @@ describe('isLoginCommand', () => {
     assert.equal(isLoginCommand(['login', '-h']), false)
     assert.equal(isLoginCommand(['discover', '-q', 'login']), false)
     assert.equal(isLoginCommand([]), false)
+  })
+})
+
+describe('run invocation preparation', () => {
+  it('finds the subcommand after global options', () => {
+    assert.equal(firstPositionalCommand(['--lang', 'zh', 'run', '-p', 'x']), 'run')
+    assert.equal(firstPositionalCommand(['--lang=zh', 'whoami']), 'whoami')
+    assert.equal(firstPositionalCommand(['discover', '-q', 'twitter']), 'discover')
+    assert.equal(firstPositionalCommand([]), undefined)
+  })
+
+  it('detects run commands but not help or look-alikes', () => {
+    assert.equal(isRunCommand(['run', '-p', 'x', '-e', 'y']), true)
+    assert.equal(isRunCommand(['--lang', 'zh', 'run', '--json']), true)
+    assert.equal(isRunCommand(['run', '--help']), false)
+    assert.equal(isRunCommand(['discover', '-q', 'run']), false)
+    assert.equal(isRunCommand([]), false)
+  })
+
+  it('extracts explicit idempotency keys in both spellings', () => {
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key', 'k1']), 'k1')
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=k2']), 'k2')
+    assert.equal(
+      extractIdempotencyKey(['run', '-i', '{"x":"--idempotency-key=trap"}', '--idempotency-key', 'k3']),
+      'k3',
+    )
+    assert.equal(extractIdempotencyKey(['discover', '-q', 'twitter']), undefined)
+  })
+
+  it('extracts wait budgets in all spellings', () => {
+    assert.equal(extractWaitSeconds(['run', '--wait', '30']), 30)
+    assert.equal(extractWaitSeconds(['run', '--wait=45']), 45)
+    assert.equal(extractWaitSeconds(['run', '-w', '60']), 60)
+    assert.equal(extractWaitSeconds(['run', '-w=15']), 15)
+    assert.equal(extractWaitSeconds(['run', '-w90']), 90)
+    assert.equal(extractWaitSeconds(['run', '--wait']), 300)
+    assert.equal(extractWaitSeconds(['runs', 'get', '-r', 'abc', '--wait', '5']), 5)
+    assert.equal(extractWaitSeconds(['discover']), undefined)
+    // a numeric value of another option must not be misread
+    assert.equal(extractWaitSeconds(['run', '-i', '{"wait":"--wait 9"}']), undefined)
+  })
+
+  it('detects output options that imply waiting', () => {
+    assert.equal(hasOutputOption(['run', '-o', 'out.json']), true)
+    assert.equal(hasOutputOption(['run', '--output=out.json']), true)
+    assert.equal(hasOutputOption(['run', '-i', '{"o":"-o"}']), false)
+  })
+
+  it('injects a fresh idempotency key only for run commands lacking one', () => {
+    const injected = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--wait', '30'])
+    assert.ok(injected.idempotencyKey !== undefined)
+    assert.match(injected.idempotencyKey, /^[0-9a-f-]{36}$/)
+    assert.deepEqual(injected.cliArgs.slice(0, -2), ['run', '-p', 'x', '-e', 'y', '--wait', '30'])
+    assert.deepEqual(injected.cliArgs.slice(-2), ['--idempotency-key', injected.idempotencyKey])
+    assert.equal(injected.waitSeconds, 30)
+
+    const kept = prepareRunInvocation(['run', '--idempotency-key', 'mine'])
+    assert.equal(kept.idempotencyKey, 'mine')
+    assert.deepEqual(kept.cliArgs, ['run', '--idempotency-key', 'mine'])
+
+    const untouched = prepareRunInvocation(['discover', '-q', 'twitter', '--json'])
+    assert.equal(untouched.idempotencyKey, undefined)
+    assert.deepEqual(untouched.cliArgs, ['discover', '-q', 'twitter', '--json'])
+
+    const implied = prepareRunInvocation(['run', '-o', 'out.json'])
+    assert.equal(implied.waitSeconds, 300)
+  })
+
+  it('extends the timeout to cover declared wait budgets', () => {
+    assert.equal(resolveTimeoutMs(1_000, undefined), 1_000)
+    assert.equal(resolveTimeoutMs(1_000, 30), 45_000)
+    assert.equal(resolveTimeoutMs(120_000, 30), 120_000)
+  })
+
+  it('extracts run IDs from partial JSON or text output', () => {
+    const id = '01a21090-8ab3-70b1-bd3a-3b83768f0741'
+    assert.equal(extractRunId(`{"runId":"${id}"}`), id)
+    assert.equal(extractRunId(`Run ID:  ${id}`), id)
+    assert.equal(extractRunId('Run submitted.'), undefined)
+    assert.equal(extractRunId(''), undefined)
+  })
+
+  it('builds WAIT_TIMEOUT notices naming the key and recovery commands', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: undefined })
+    assert.ok(notice !== undefined)
+    assert.match(notice, /WAIT_TIMEOUT/)
+    assert.match(notice, /idempotencyKey: key-1/)
+    assert.match(notice, /runs get --idempotency-key key-1 --wait --json/)
+    assert.match(notice, /--idempotency-key key-1/)
+
+    const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: 'abc' })
+    assert.ok(withRunId !== undefined)
+    assert.match(withRunId, /runId: abc/)
+    assert.match(withRunId, /runs get -r abc --wait --json/)
+
+    assert.equal(buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: undefined }), undefined)
   })
 })
 
@@ -289,6 +394,88 @@ describe('solgrid plugin integration', () => {
     try {
       const res = await tools[0].execute({ args: ['sleep', '10000'], timeoutMs: 150 }, makeExec())
       assert.equal(res.status, 'timeout')
+      assert.equal(res.hint, undefined) // non-run commands get no recovery notice
+    } finally {
+      dispose()
+    }
+  })
+
+  it('injects an idempotency key into run commands and passes it to the CLI', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute({ args: ['run', '-p', 'x', '-e', 'y', '--json'] }, makeExec())
+      assert.equal(res.status, 'ok')
+      const parsed = JSON.parse(res.stdout)
+      assert.equal(parsed.args.length, 8)
+      assert.equal(parsed.args[6], '--idempotency-key')
+      assert.match(parsed.args[7], /^[0-9a-f-]{36}$/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('keeps an explicit idempotency key untouched', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--idempotency-key', 'agent-key-1'] },
+        makeExec(),
+      )
+      assert.equal(res.status, 'ok')
+      const parsed = JSON.parse(res.stdout)
+      assert.deepEqual(parsed.args, ['run', '--idempotency-key', 'agent-key-1'])
+    } finally {
+      dispose()
+    }
+  })
+
+  it('extends the effective timeout to cover a declared --wait budget', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // Mock finishes ~1.3s in; without extension the 200ms tool timeout would kill it first.
+      const res = await tools[0].execute(
+        { args: ['run', '--wait', '1'], timeoutMs: 200 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'ok')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('returns a WAIT_TIMEOUT recovery hint when a run is cut off by the tool timeout', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute({ args: ['run', '--hang'], timeoutMs: 200 }, makeExec())
+      assert.equal(res.status, 'timeout')
+      assert.equal(res.exitCode, 1)
+      assert.equal(res.stdout, '')
+      assert.match(res.hint, /WAIT_TIMEOUT/)
+      assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36}/)
+      assert.match(res.hint, /runs get --idempotency-key [0-9a-f-]{36} --wait --json/)
+
+      const rendered = tools[0].output.render({ args: ['run', '--hang'] }, res)
+      assert.match(rendered[0].text, /status: timeout/)
+      assert.match(rendered[0].text, /WAIT_TIMEOUT/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('names a caller-provided idempotency key in the timeout hint', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.match(res.hint, /idempotencyKey: agent-key-2/)
     } finally {
       dispose()
     }

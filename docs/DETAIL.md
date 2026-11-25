@@ -26,3 +26,11 @@ On your first use, the agent will display a Solgrid authorization link and short
 - Running paid tools charges your [Solgrid](https://solgrid.ai) wallet in **Spark** (1 USD = 100 Spark). The agent checks pricing before running expensive tools.
 - Uploaded local files are private and accessed through temporary signed URLs (valid for 24 hours).
 - Credentials are stored locally under `~/.config/solgrid/cli/` and shared with the standalone `solgrid` CLI if you also use it in your terminal.
+
+## Timeouts & billing safety
+
+Paid runs keep running (and get billed) on Solgrid even if the local CLI is stopped, so the plugin never lets a timeout silently lose track of one:
+
+- A declared `--wait <seconds>` budget (or the wait implied by `-o`) always wins over the tool timeout: the effective limit is extended to the wait plus a grace margin, and the CLI itself returns a `WAIT_TIMEOUT` error naming the run ID, the idempotency key and the follow-up command.
+- Every `run` receives an auto-injected `--idempotency-key`, so even a residual hard timeout returns a recovery hint. Follow it with `runs get --idempotency-key <key> --wait` to fetch the finished run, or re-run the same command with that key — Solgrid returns the existing run instead of charging a second one.
+- The remaining timeout (`defaultTimeoutMs`, `timeoutMs`) is a safety net against hung processes such as long downloads, not a deadline for in-flight runs.

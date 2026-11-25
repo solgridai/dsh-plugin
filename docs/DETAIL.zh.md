@@ -26,3 +26,11 @@
 - 运行付费工具将按次从你的 [Solgrid](https://solgrid.ai) 钱包扣除 **Spark**（1 USD = 100 Spark），Agent 会先查价再执行。
 - 上传的本地文件默认私有，仅通过 24 小时有效的临时签名 URL 供工具读取。
 - 凭证保存在本机 `~/.config/solgrid/cli/`，如你同时在终端使用独立版 `solgrid` CLI，登录态自动互通。
+
+## 超时与计费安全
+
+付费 run 提交后即使本地 CLI 被停止，也会继续在 Solgrid 侧运行并计费，因此插件不会让超时静默丢失一次 run：
+
+- 声明的 `--wait <秒>`（含 `-o` 隐含的等待）始终优先于工具超时：有效超时会延长到该时长加富余，由 CLI 自己返回 `WAIT_TIMEOUT`，其中带有 run ID、idempotency key 和后续命令。
+- 每次 `run` 都会自动注入 `--idempotency-key`，即使残余的硬超时也会返回恢复提示。按提示执行 `runs get --idempotency-key <key> --wait` 即可取回已完成的 run，或用同一 key 重跑同一命令——Solgrid 会返回已有 run，不会二次扣费。
+- 其余超时（`defaultTimeoutMs`、`timeoutMs`）仅是防挂死安全网（如大文件下载），不是对进行中 run 的截止时间。

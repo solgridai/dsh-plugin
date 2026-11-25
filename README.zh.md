@@ -50,9 +50,15 @@ dsh plugin --profile web add github:solgridai/dsh-plugin
   config:
     apiBaseUrl: https://api.solgrid.ai   # 可选：覆盖 API 地址
     lang: zh                             # 可选："en" 或 "zh"
-    defaultTimeoutMs: 300000             # 可选：默认命令超时毫秒数（默认 300000）
+    defaultTimeoutMs: 300000             # 可选：子进程安全网超时毫秒数（默认 300000）
     maxOutputChars: 200000               # 可选：stdout/stderr 截断上限（默认 200000）
 ```
+
+超时采用分层设计，付费 run 不会因硬杀而丢失：
+
+- 声明了 `--wait <秒>` 的命令（含 `-o <文件>` 隐含的等待）至少会拿到该时长加一段富余，让 CLI 自己报出 `WAIT_TIMEOUT`（带 runId、idempotency key 和恢复命令），工具超时不会先到。
+- 每次 `run` 会自动注入 `--idempotency-key`（除非你显式传入），因此即使残余的硬超时也会返回恢复提示：`solgrid runs get --idempotency-key <key> --wait --json` 可找回该 run，用同一 key 重跑也不会重复扣费。
+- `defaultTimeoutMs` / 工具参数 `timeoutMs` 仅作为防挂死的安全网（下载、网络卡住等）。
 
 ## 开发与检查
 
