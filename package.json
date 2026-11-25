@@ -1,6 +1,6 @@
 {
   "name": "@solgridai/dsh-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Discover and run Solgrid third-party tools and creative skills (social media data, image & video generation, and more) in DeepSeek Harness — zero setup.",
   "author": "Solgrid",
   "license": "MIT",
