@@ -159,7 +159,7 @@ describe('timeout notices', () => {
     const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
     assert.match(notice, /WAIT_TIMEOUT/)
     assert.match(notice, /idempotencyKey: job wait=1/)
-    assert.match(notice, /--idempotency-key 'job wait=1' --wait --json/)
+    assert.match(notice, /--idempotency-key='job wait=1' --wait --json/)
     assert.doesNotMatch(notice, /last occurrence/)
 
     const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'k', runId: 'abc' })
@@ -170,7 +170,18 @@ describe('timeout notices', () => {
   it('quotes the recovery command so keys with spaces survive copy-paste', () => {
     const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
     assert.match(notice, /idempotencyKey: job wait=1/)
-    assert.match(notice, /--idempotency-key 'job wait=1' --wait --json/)
+    assert.match(notice, /--idempotency-key='job wait=1' --wait --json/)
+  })
+
+  it('uses the single-token = form so option-looking keys survive the root parser', () => {
+    // A space form (--idempotency-key --version) is extracted by the root program as its own
+    // --version option before the subcommand sees the key; the = form is one opaque token.
+    const version = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: '--version' })
+    assert.match(version, /idempotencyKey: --version/)
+    assert.match(version, /--idempotency-key=--version --wait --json/)
+
+    const spaced = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(spaced, /--idempotency-key='job wait=1' --wait --json/)
   })
 
   it('quotes only what a POSIX shell would split', () => {
@@ -468,8 +479,26 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'timeout')
       assert.doesNotMatch(res.hint, /no run was started/) // the report was found in the raw stream
       assert.match(res.hint, /idempotencyKey: mock-generated-key/)
-      assert.match(res.hint, /runs get --idempotency-key mock-generated-key --wait --json/)
+      assert.match(res.hint, /runs get --idempotency-key=mock-generated-key --wait --json/)
       assert.ok(!res.stderr.includes('solgrid:')) // display output stayed truncated
+    } finally {
+      dispose()
+    }
+  })
+
+  it('finds the report even after 2MiB of stderr noise (no scan cap to hit)', async () => {
+    // P2 regression: the scanner once stopped at a 1MiB raw cap, losing a later report and
+    // misreporting a submitted run as safe to re-run. Line-by-line scanning has no cap.
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--huge-noise', '--hang'], timeoutMs: 200 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.doesNotMatch(res.hint, /no run was started/)
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
     } finally {
       dispose()
     }
@@ -486,7 +515,7 @@ describe('solgrid plugin integration', () => {
       assert.match(res.stderr, /^solgrid: \{"idempotencyKey":"mock-generated-key"\}$/)
       assert.match(res.hint, /WAIT_TIMEOUT/)
       assert.match(res.hint, /idempotencyKey: mock-generated-key/)
-      assert.match(res.hint, /runs get --idempotency-key mock-generated-key --wait --json/)
+      assert.match(res.hint, /runs get --idempotency-key=mock-generated-key --wait --json/)
       assert.doesNotMatch(res.hint, /last occurrence/) // reported key: exact, no caveats
 
       const rendered = tools[0].output.render({ args: ['run', '--hang'] }, res)

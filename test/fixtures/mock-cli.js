@@ -45,6 +45,12 @@ if (cmd === 'sleep') {
   }
   key = key ?? 'mock-generated-key'
 
+  if (args.includes('--huge-noise')) {
+    // A single 2MiB stderr line before the report: exercises the line scanner's drop/realign
+    // path — the report must still be found regardless of preceding noise volume.
+    process.stderr.write(`${'x'.repeat(2 * 1024 * 1024)}\n`)
+  }
+
   if (args.includes('--noisy')) {
     // 2KB of stderr noise before the report line: exercises report parsing decoupled from
     // the display truncation cap.

@@ -31,11 +31,11 @@ const WAIT_GRACE_MS = 15_000
 /** setTimeout() overflows above 2^31-1 ms (Node fires such timers after ~1ms); clamp well below. */
 const MAX_TIMEOUT_MS = 2_147_483_000
 /**
- * Safety cap for the raw (untruncated) stderr scanned for the report line. The report precedes
- * any network I/O, so pre-report stderr is startup-sized; this bounds memory only for the
- * pathological case of a CLI that floods stderr without ever reporting.
+ * A report line is tiny (prefix + JSON of a ≤128-char key, worst-case escaped, + a number);
+ * anything longer can never be one. Oversized partial lines are dropped to keep the scanner's
+ * memory bounded regardless of how much stderr noise precedes the report.
  */
-const RAW_STDERR_CAP = 1_048_576
+const MAX_REPORT_LINE = 1024
 /** Characters POSIX shells treat safely unquoted within a single word. */
 const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/
 
@@ -295,9 +295,13 @@ export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
   if (runId !== undefined) {
     lines.push(`runId: ${runId}`, `Check it with: solgrid runs get -r ${runId} --wait --json`)
   }
+  // Single-token `--idempotency-key=<key>` form: a separate `--idempotency-key <key>` would let
+  // the root program eat an option-looking key (e.g. `--version`) mid-stream before the
+  // subcommand ever sees it. The = form is one token the root passes through untouched.
+  const quotedKey = shellQuote(idempotencyKey)
   lines.push(
     `idempotencyKey: ${idempotencyKey}`,
-    `Check it with: solgrid runs get --idempotency-key ${shellQuote(idempotencyKey)} --wait --json`,
+    `Check it with: solgrid runs get --idempotency-key=${quotedKey} --wait --json`,
   )
   return lines.join('\n')
 }
@@ -456,8 +460,10 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
 
       let stdout = ''
       let stderr = ''
-      /** Untruncated stderr, scanned for the report line until it is found. */
-      let rawStderr = ''
+      /** The stderr line currently being assembled, scanned for the report as it completes. */
+      let pendingLine = ''
+      /** True while skipping the first completed line after dropping an oversized partial one. */
+      let realigning = false
       let reportFound = false
       let settled = false
       let timedOut = false
@@ -504,11 +510,12 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
        * network I/O. On arrival: remember the exact effective key, and realign the safety net
        * with the reported wait budget (only ever extending it) so the CLI's own WAIT_TIMEOUT —
        * run ID, key and recovery hints included — is what the agent sees, not a hard kill.
-       * @param {string} text untruncated stderr accumulated since spawn
+       * @param {string} line one completed stderr line
+       * @returns {boolean} true when the report line was recognized
        */
-      const onStderr = (text) => {
-        const report = parseRunReport(text)
-        if (report === undefined) return
+      const onStderrLine = (line) => {
+        const report = parseRunReport(line)
+        if (report === undefined) return false
         if (report.idempotencyKey !== undefined) reportedKey = report.idempotencyKey
         if (report.waitSeconds !== undefined && !timedOut) {
           const next = resolveTimeoutMs(timeoutMs, report.waitSeconds)
@@ -526,19 +533,34 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       child.stdout.on('data', (chunk) => {
         stdout = appendLimited(stdout, chunk, maxOutputChars)
       })
-      // The report is parsed from the RAW stream, decoupled from the display truncation below:
-      // a full display buffer must never drop the report line, or a killed run would be
-      // misread as "never submitted". Accumulation stops once the report is found (and is
-      // capped regardless), so memory stays bounded: the report precedes network I/O, so
-      // pre-report stderr is startup-sized.
+      // The report is scanned line by line, decoupled from the display truncation above: a
+      // full display buffer must never hide the report, and neither may unbounded stderr noise
+      // evict it (inherited NODE_DEBUG=module and friends can write megabytes before it).
+      // Memory stays bounded at one line: completed lines are tested and dropped immediately,
+      // and an oversized partial line can never be the report — it is dropped and scanning
+      // realigns at the next newline.
       child.stderr.on('data', (chunk) => {
         stderr = appendLimited(stderr, chunk, maxOutputChars)
-        if (!reportFound && rawStderr.length < RAW_STDERR_CAP) {
-          rawStderr += chunk
-          if (onStderr(rawStderr) === true) {
-            reportFound = true
-            rawStderr = ''
+        if (reportFound) return
+        pendingLine += chunk
+        let newline = pendingLine.indexOf('\n')
+        while (newline !== -1) {
+          const line = pendingLine.slice(0, newline)
+          pendingLine = pendingLine.slice(newline + 1)
+          newline = pendingLine.indexOf('\n')
+          if (realigning) {
+            realigning = false // completed a line we had partially dropped: not line-aligned
+            continue
           }
+          if (onStderrLine(line) === true) {
+            reportFound = true
+            pendingLine = ''
+            return
+          }
+        }
+        if (pendingLine.length > MAX_REPORT_LINE) {
+          pendingLine = ''
+          realigning = true
         }
       })
       child.on('error', (err) => fail(err))
