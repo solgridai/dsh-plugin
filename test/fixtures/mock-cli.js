@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Minimal mock CLI for unit tests.
+// Minimal mock CLI for unit tests. Mirrors the real CLI's wrapper-recovery protocol:
+// `--idempotency-key` beats SOLGRID_IDEMPOTENCY_KEY beats a generated key, and
+// `solgrid: idempotencyKey=<key> wait=<seconds>` is written to stderr before any work.
 const args = process.argv.slice(2)
 const cmd = args[0]
 
@@ -28,6 +30,68 @@ if (cmd === 'sleep') {
     console.log('awake')
     process.exit(0)
   }, ms)
+} else if (cmd === 'run' || (cmd === 'runs' && args[1] === 'get')) {
+  // Key resolution: explicit flag, then a generated key — reported on stderr as JSON before work.
+  let key
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--idempotency-key') {
+      key = args[i + 1]
+      break
+    }
+    if (args[i].startsWith('--idempotency-key=')) {
+      key = args[i].slice('--idempotency-key='.length)
+      break
+    }
+  }
+  key = key ?? 'mock-generated-key'
+
+  if (args.includes('--huge-noise')) {
+    // A single 2MiB stderr line before the report: exercises the line scanner's drop/realign
+    // path — the report must still be found regardless of preceding noise volume.
+    process.stderr.write(`${'x'.repeat(2 * 1024 * 1024)}\n`)
+  }
+
+  if (args.includes('--noisy')) {
+    // 2KB of stderr noise before the report line: exercises report parsing decoupled from
+    // the display truncation cap.
+    process.stderr.write(`${'x'.repeat(2048)}\n`)
+  }
+
+  /** @type {number | undefined} */
+  let wait
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--wait' || args[i] === '-w') {
+      wait = /^\d+$/.test(args[i + 1] ?? '') ? Number(args[i + 1]) : 300
+    } else if (args[i].startsWith('--wait=')) {
+      wait = Number(args[i].slice('--wait='.length))
+    }
+  }
+
+  const report =
+    cmd === 'run'
+      ? { idempotencyKey: key, ...(wait !== undefined ? { wait } : {}) }
+      : { wait: wait ?? 300 }
+  if (cmd === 'runs' && wait === undefined) {
+    // runs get without --wait reports nothing and returns immediately.
+    console.log(JSON.stringify({ args }))
+    process.exit(0)
+  }
+  if (args.includes('--silent-hang')) {
+    // Hang without reporting: simulates the CLI being killed before it writes the report line
+    // (and thus before any submission — nothing to recover).
+    setTimeout(() => process.exit(0), 60_000)
+  } else {
+    process.stderr.write(`solgrid: ${JSON.stringify(report)}\n`)
+    if (args.includes('--hang')) {
+      setTimeout(() => process.exit(0), 60_000)
+    } else {
+      const delay = wait !== undefined ? wait * 1000 + 300 : 0
+      setTimeout(() => {
+        console.log(JSON.stringify({ args, ...(cmd === 'run' ? { key, wait: wait ?? null } : {}) }))
+        process.exit(0)
+      }, delay)
+    }
+  }
 } else if (cmd === 'login') {
   if (args.includes('--fail')) {
     console.error('network error')

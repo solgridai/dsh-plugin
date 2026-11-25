@@ -24,5 +24,6 @@
 
 - 搜索工具、查看参数和单价、浏览 SkillHub 均免费。
 - 运行付费工具将按次从你的 [Solgrid](https://solgrid.ai) 钱包扣除 **Spark**（1 USD = 100 Spark），Agent 会先查价再执行。
+- 中断的 run（超时、崩溃）可凭幂等键找回，Agent 会恢复原 run 而不是重复付费。
 - 上传的本地文件默认私有，仅通过 24 小时有效的临时签名 URL 供工具读取。
 - 凭证保存在本机 `~/.config/solgrid/cli/`，如你同时在终端使用独立版 `solgrid` CLI，登录态自动互通。

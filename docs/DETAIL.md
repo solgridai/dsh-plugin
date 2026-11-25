@@ -24,5 +24,6 @@ On your first use, the agent will display a Solgrid authorization link and short
 
 - Discovering tools, inspecting schemas/prices, and browsing SkillHub are free.
 - Running paid tools charges your [Solgrid](https://solgrid.ai) wallet in **Spark** (1 USD = 100 Spark). The agent checks pricing before running expensive tools.
+- A run interrupted mid-session (timeout, crash) stays recoverable by its idempotency key — the agent resumes the original run instead of paying twice.
 - Uploaded local files are private and accessed through temporary signed URLs (valid for 24 hours).
 - Credentials are stored locally under `~/.config/solgrid/cli/` and shared with the standalone `solgrid` CLI if you also use it in your terminal.

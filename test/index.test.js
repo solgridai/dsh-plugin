@@ -8,9 +8,17 @@ import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import {
   applyWithCli,
   buildCliEnv,
+  buildNotReportedNotice,
+  buildTimeoutNotice,
   createAbortError,
+  extractRunId,
+  firstPositionalCommand,
   isLoginCommand,
+  isRunCommand,
+  parseRunReport,
   parseSkillMarkdown,
+  resolveTimeoutMs,
+  shellQuote,
 } from '../index.js'
 
 const mockCliPath = fileURLToPath(new URL('./fixtures/mock-cli.js', import.meta.url))
@@ -120,17 +128,127 @@ describe('parseSkillMarkdown', () => {
   })
 })
 
-describe('isLoginCommand', () => {
+describe('command detection', () => {
+  it('finds the subcommand after root-level global options', () => {
+    assert.equal(firstPositionalCommand(['--lang', 'zh', 'run', '-p', 'x']), 'run')
+    assert.equal(firstPositionalCommand(['--lang=zh', 'whoami']), 'whoami')
+    assert.equal(firstPositionalCommand(['-v', 'run', '-p', 'x']), 'run')
+    assert.equal(firstPositionalCommand(['discover', '-q', 'twitter']), 'discover')
+    assert.equal(firstPositionalCommand(['run', '--lang', 'en', 'discover']), 'run')
+    assert.equal(firstPositionalCommand([]), undefined)
+  })
+
   it('detects login invocations with or without leading flags', () => {
     assert.equal(isLoginCommand(['login']), true)
     assert.equal(isLoginCommand(['--lang', 'zh', 'login', '--json']), true)
-  })
-
-  it('ignores help requests and other commands', () => {
-    assert.equal(isLoginCommand(['login', '--help']), false)
-    assert.equal(isLoginCommand(['login', '-h']), false)
     assert.equal(isLoginCommand(['discover', '-q', 'login']), false)
     assert.equal(isLoginCommand([]), false)
+  })
+
+  it('detects run invocations, including help requests (env is inert on help)', () => {
+    assert.equal(isRunCommand(['run', '-p', 'x', '-e', 'y']), true)
+    assert.equal(isRunCommand(['--lang', 'zh', 'run', '--json']), true)
+    assert.equal(isRunCommand(['run', '--help']), true)
+    assert.equal(isRunCommand(['discover', '-q', 'run']), false)
+    assert.equal(isRunCommand([]), false)
+  })
+})
+
+describe('timeout notices', () => {
+  it('reports the exact key the CLI reported, without caveats', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(notice, /WAIT_TIMEOUT/)
+    assert.match(notice, /idempotencyKey: job wait=1/)
+    assert.match(notice, /--idempotency-key='job wait=1' --wait --json/)
+    assert.doesNotMatch(notice, /last occurrence/)
+
+    const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'k', runId: 'abc' })
+    assert.match(withRunId, /runId: abc/)
+    assert.match(withRunId, /runs get -r abc --wait --json/)
+  })
+
+  it('quotes the recovery command so keys with spaces survive copy-paste', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(notice, /idempotencyKey: job wait=1/)
+    assert.match(notice, /--idempotency-key='job wait=1' --wait --json/)
+  })
+
+  it('uses the single-token = form so option-looking keys survive the root parser', () => {
+    // A space form (--idempotency-key --version) is extracted by the root program as its own
+    // --version option before the subcommand sees the key; the = form is one opaque token.
+    const version = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: '--version' })
+    assert.match(version, /idempotencyKey: --version/)
+    assert.match(version, /--idempotency-key=--version --wait --json/)
+
+    const spaced = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(spaced, /--idempotency-key='job wait=1' --wait --json/)
+  })
+
+  it('quotes only what a POSIX shell would split', () => {
+    assert.equal(shellQuote('01a21090-8ab3-70b1-bd3a-3b83768f0741'), '01a21090-8ab3-70b1-bd3a-3b83768f0741')
+    assert.equal(shellQuote('step-1'), 'step-1')
+    assert.equal(shellQuote('job wait=1'), "'job wait=1'")
+    assert.equal(shellQuote("it's"), "'it'\\''s'")
+    assert.equal(shellQuote('a\nb'), "'a\nb'")
+  })
+
+  it('says nothing was submitted when the CLI was killed before reporting', () => {
+    const notice = buildNotReportedNotice(1_000)
+    assert.match(notice, /WAIT_TIMEOUT/)
+    assert.match(notice, /before it reported its idempotency key/)
+    assert.match(notice, /no run was started/)
+    assert.match(notice, /re-running the identical command is safe/)
+  })
+})
+
+describe('parseRunReport', () => {
+  it('parses the JSON report line', () => {
+    assert.deepEqual(parseRunReport('solgrid: {"idempotencyKey":"abc","wait":30}\n'), {
+      idempotencyKey: 'abc',
+      waitSeconds: 30,
+    })
+  })
+
+  it('carries keys with spaces and = losslessly, exactly like the CLI writes them', () => {
+    assert.deepEqual(parseRunReport('solgrid: {"idempotencyKey":"job wait=1","wait":30}'), {
+      idempotencyKey: 'job wait=1',
+      waitSeconds: 30,
+    })
+  })
+
+  it('parses wait-only reports and finds the line among other output', () => {
+    assert.deepEqual(parseRunReport('noise\nsolgrid: {"wait":300}\nmore noise'), {
+      idempotencyKey: undefined,
+      waitSeconds: 300,
+    })
+  })
+
+  it('ignores truncated lines, other solgrid lines, garbage and empty text', () => {
+    assert.equal(parseRunReport('solgrid: {"idempotencyKey":"ab'), undefined) // split chunk
+    assert.equal(parseRunReport('solgrid: update available 0.7.0\n'), undefined)
+    assert.equal(parseRunReport('solgrid: not json\n'), undefined)
+    assert.equal(parseRunReport('Error: nope\n'), undefined)
+    assert.equal(parseRunReport(''), undefined)
+  })
+})
+
+describe('resolveTimeoutMs', () => {
+  it('extends to cover reported wait budgets and clamps below setTimeout overflow', () => {
+    assert.equal(resolveTimeoutMs(1_000, undefined), 1_000)
+    assert.equal(resolveTimeoutMs(1_000, 30), 45_000)
+    assert.equal(resolveTimeoutMs(120_000, 30), 120_000)
+    assert.equal(resolveTimeoutMs(300, 1e9), 2_147_483_000)
+    assert.equal(resolveTimeoutMs(1e15, undefined), 2_147_483_000)
+  })
+})
+
+describe('extractRunId', () => {
+  it('extracts run IDs from partial JSON or text output', () => {
+    const id = '01a21090-8ab3-70b1-bd3a-3b83768f0741'
+    assert.equal(extractRunId(`{"runId":"${id}"}`), id)
+    assert.equal(extractRunId(`Run ID:  ${id}`), id)
+    assert.equal(extractRunId('Run submitted.'), undefined)
+    assert.equal(extractRunId(''), undefined)
   })
 })
 
@@ -283,12 +401,171 @@ describe('solgrid plugin integration', () => {
     }
   })
 
-  it('returns timeout status when command exceeds timeoutMs', async () => {
+  it('returns timeout status without a recovery notice for non-run commands', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
       const res = await tools[0].execute({ args: ['sleep', '10000'], timeoutMs: 150 }, makeExec())
       assert.equal(res.status, 'timeout')
+      assert.equal(res.hint, undefined)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('passes arguments through verbatim and echoes the generated key', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '-p', 'x', '-e', 'y', '--json'] },
+        makeExec(),
+      )
+      assert.equal(res.status, 'ok')
+      const parsed = JSON.parse(res.stdout)
+      assert.deepEqual(parsed.args, ['run', '-p', 'x', '-e', 'y', '--json']) // argv untouched
+      assert.equal(parsed.key, 'mock-generated-key') // the CLI generated and reported it
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reports an explicit --idempotency-key as the resolved key', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--idempotency-key', 'agent-key-1', '--json'] },
+        makeExec(),
+      )
+      assert.equal(res.status, 'ok')
+      const parsed = JSON.parse(res.stdout)
+      assert.deepEqual(parsed.args, ['run', '--idempotency-key', 'agent-key-1', '--json'])
+      assert.equal(parsed.key, 'agent-key-1')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('re-arms the timeout when the CLI reports a wait budget', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // Mock finishes ~1.3s in; without the re-arm the 200ms safety net would kill it first.
+      const res = await tools[0].execute({ args: ['run', '--wait', '1'], timeoutMs: 200 }, makeExec())
+      assert.equal(res.status, 'ok')
+
+      const lookup = await tools[0].execute(
+        { args: ['runs', 'get', '-r', 'run_01', '--wait', '1'], timeoutMs: 200 },
+        makeExec(),
+      )
+      assert.equal(lookup.status, 'ok')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('parses the report from the raw stream even when the display stderr is truncated', async () => {
+    // P2 regression: 2KB of noise before the report line + a 1KB display cap. The display
+    // buffer fills first and drops the report; parsing must read the raw stream instead, or
+    // the killed run would be misreported as "never submitted" — a duplicate-billing hazard.
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, { maxOutputChars: 1024 }, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--noisy', '--hang'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.doesNotMatch(res.hint, /no run was started/) // the report was found in the raw stream
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
+      assert.match(res.hint, /runs get --idempotency-key=mock-generated-key --wait --json/)
+      assert.ok(!res.stderr.includes('solgrid:')) // display output stayed truncated
+    } finally {
+      dispose()
+    }
+  })
+
+  it('finds the report even after 2MiB of stderr noise (no scan cap to hit)', async () => {
+    // P2 regression: the scanner once stopped at a 1MiB raw cap, losing a later report and
+    // misreporting a submitted run as safe to re-run. Line-by-line scanning has no cap.
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--huge-noise', '--hang'], timeoutMs: 200 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.doesNotMatch(res.hint, /no run was started/)
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('returns an exact recovery hint naming the reported key when a run is killed', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute({ args: ['run', '--hang'], timeoutMs: 200 }, makeExec())
+      assert.equal(res.status, 'timeout')
+      assert.equal(res.exitCode, 1)
+      assert.equal(res.stdout, '')
+      assert.match(res.stderr, /^solgrid: \{"idempotencyKey":"mock-generated-key"\}$/)
+      assert.match(res.hint, /WAIT_TIMEOUT/)
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
+      assert.match(res.hint, /runs get --idempotency-key=mock-generated-key --wait --json/)
+      assert.doesNotMatch(res.hint, /last occurrence/) // reported key: exact, no caveats
+
+      const rendered = tools[0].output.render({ args: ['run', '--hang'] }, res)
+      assert.match(rendered[0].text, /status: timeout/)
+      assert.match(rendered[0].text, /WAIT_TIMEOUT/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('says nothing was submitted when killed before the CLI reported', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // --silent-hang: the child hangs before writing the report line — by protocol, before
+      // any submission — so the recovery notice must say re-running is safe, without a key.
+      const res = await tools[0].execute(
+        { args: ['run', '--silent-hang'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.equal(res.stderr, '')
+      assert.match(res.hint, /before it reported its idempotency key/)
+      assert.match(res.hint, /no run was started/)
+      assert.doesNotMatch(res.hint, /idempotencyKey: /)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('names an explicitly passed key exactly in the timeout hint', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // The CLI resolves and reports the key itself; even killed, the hint is exact.
+      // Keys containing spaces round-trip losslessly through the JSON report line.
+      const res = await tools[0].execute(
+        { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.match(res.hint, /idempotencyKey: agent-key-2/)
+      assert.doesNotMatch(res.hint, /last occurrence/)
+
+      const spaced = await tools[0].execute(
+        { args: ['run', '--hang', '--idempotency-key', 'job wait=1', '--wait', '30'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(spaced.status, 'timeout')
+      assert.match(spaced.hint, /idempotencyKey: job wait=1/)
     } finally {
       dispose()
     }

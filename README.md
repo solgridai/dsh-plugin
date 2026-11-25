@@ -52,9 +52,15 @@ You can also configure the plugin in your profile's `cordis.patch.yml`:
   config:
     apiBaseUrl: https://api.solgrid.ai   # optional API base URL override
     lang: en                             # optional: "en" or "zh"
-    defaultTimeoutMs: 300000             # optional command timeout in ms (default: 300000)
+    defaultTimeoutMs: 300000             # optional safety-net subprocess timeout in ms (default: 300000)
     maxOutputChars: 200000               # optional stdout/stderr truncation cap (default: 200000)
 ```
+
+Timeouts are layered so paid runs are never lost to a hard kill (via the bundled `@solgridai/cli` 0.7.0+ wrapper protocol):
+
+- Every `run` reports its resolved idempotency key and wait budget on stderr before submitting — the plugin never modifies the arguments.
+- The CLI prints `solgrid: {"idempotencyKey":"<key>","wait":<seconds>}` to stderr before submitting. stderr is not buffered by `--json` mode, so the line survives even a SIGKILL. The plugin reads it to align its timeout with the wait budget — the CLI's own `WAIT_TIMEOUT`, with run ID, key and recovery commands, is what the agent sees — and to name the exact key in a recovery hint when it must stop the CLI mid-run.
+- `defaultTimeoutMs` / the tool's `timeoutMs` remain as a safety net against hung processes (downloads, network stalls).
 
 ## Development
 
