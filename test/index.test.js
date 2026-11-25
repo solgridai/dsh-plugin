@@ -18,6 +18,7 @@ import {
   parseRunReport,
   parseSkillMarkdown,
   resolveTimeoutMs,
+  shellQuote,
 } from '../index.js'
 
 const mockCliPath = fileURLToPath(new URL('./fixtures/mock-cli.js', import.meta.url))
@@ -158,12 +159,26 @@ describe('timeout notices', () => {
     const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
     assert.match(notice, /WAIT_TIMEOUT/)
     assert.match(notice, /idempotencyKey: job wait=1/)
-    assert.match(notice, /runs get --idempotency-key job wait=1 --wait --json/)
+    assert.match(notice, /--idempotency-key 'job wait=1' --wait --json/)
     assert.doesNotMatch(notice, /last occurrence/)
 
     const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'k', runId: 'abc' })
     assert.match(withRunId, /runId: abc/)
     assert.match(withRunId, /runs get -r abc --wait --json/)
+  })
+
+  it('quotes the recovery command so keys with spaces survive copy-paste', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(notice, /idempotencyKey: job wait=1/)
+    assert.match(notice, /--idempotency-key 'job wait=1' --wait --json/)
+  })
+
+  it('quotes only what a POSIX shell would split', () => {
+    assert.equal(shellQuote('01a21090-8ab3-70b1-bd3a-3b83768f0741'), '01a21090-8ab3-70b1-bd3a-3b83768f0741')
+    assert.equal(shellQuote('step-1'), 'step-1')
+    assert.equal(shellQuote('job wait=1'), "'job wait=1'")
+    assert.equal(shellQuote("it's"), "'it'\\''s'")
+    assert.equal(shellQuote('a\nb'), "'a\nb'")
   })
 
   it('says nothing was submitted when the CLI was killed before reporting', () => {
@@ -434,6 +449,27 @@ describe('solgrid plugin integration', () => {
         makeExec(),
       )
       assert.equal(lookup.status, 'ok')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('parses the report from the raw stream even when the display stderr is truncated', async () => {
+    // P2 regression: 2KB of noise before the report line + a 1KB display cap. The display
+    // buffer fills first and drops the report; parsing must read the raw stream instead, or
+    // the killed run would be misreported as "never submitted" — a duplicate-billing hazard.
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, { maxOutputChars: 1024 }, resolved)
+    try {
+      const res = await tools[0].execute(
+        { args: ['run', '--noisy', '--hang'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.doesNotMatch(res.hint, /no run was started/) // the report was found in the raw stream
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
+      assert.match(res.hint, /runs get --idempotency-key mock-generated-key --wait --json/)
+      assert.ok(!res.stderr.includes('solgrid:')) // display output stayed truncated
     } finally {
       dispose()
     }

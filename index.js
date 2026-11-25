@@ -30,6 +30,27 @@ const SIGKILL_GRACE_MS = 2_000
 const WAIT_GRACE_MS = 15_000
 /** setTimeout() overflows above 2^31-1 ms (Node fires such timers after ~1ms); clamp well below. */
 const MAX_TIMEOUT_MS = 2_147_483_000
+/**
+ * Safety cap for the raw (untruncated) stderr scanned for the report line. The report precedes
+ * any network I/O, so pre-report stderr is startup-sized; this bounds memory only for the
+ * pathological case of a CLI that floods stderr without ever reporting.
+ */
+const RAW_STDERR_CAP = 1_048_576
+/** Characters POSIX shells treat safely unquoted within a single word. */
+const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/
+
+/**
+ * Quote a value for a copy-pasteable POSIX shell command. Idempotency keys may contain spaces,
+ * quotes or newlines, and an unquoted hint command would split the key into several arguments
+ * and fail with a usage error — the lossless JSON report would then break at recovery time.
+ * Safe values (UUIDs and friends) stay unquoted for readability.
+ * @param {string} value
+ * @returns {string}
+ */
+export function shellQuote(value) {
+  if (SHELL_SAFE.test(value)) return value
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
 
 /**
  * Parse the CLI's stderr report line — `solgrid: {"idempotencyKey":"<key>","wait":<seconds>}` —
@@ -276,7 +297,7 @@ export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
   }
   lines.push(
     `idempotencyKey: ${idempotencyKey}`,
-    `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
+    `Check it with: solgrid runs get --idempotency-key ${shellQuote(idempotencyKey)} --wait --json`,
   )
   return lines.join('\n')
 }
@@ -435,6 +456,9 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
 
       let stdout = ''
       let stderr = ''
+      /** Untruncated stderr, scanned for the report line until it is found. */
+      let rawStderr = ''
+      let reportFound = false
       let settled = false
       let timedOut = false
       /** The idempotency key the CLI reported on stderr — its own resolved, exact one. */
@@ -480,7 +504,7 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
        * network I/O. On arrival: remember the exact effective key, and realign the safety net
        * with the reported wait budget (only ever extending it) so the CLI's own WAIT_TIMEOUT —
        * run ID, key and recovery hints included — is what the agent sees, not a hard kill.
-       * @param {string} text accumulated stderr
+       * @param {string} text untruncated stderr accumulated since spawn
        */
       const onStderr = (text) => {
         const report = parseRunReport(text)
@@ -494,6 +518,7 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
             timer = setTimeout(onTimeout, currentTimeoutMs)
           }
         }
+        return true
       }
 
       child.stdout.setEncoding('utf8')
@@ -501,9 +526,20 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       child.stdout.on('data', (chunk) => {
         stdout = appendLimited(stdout, chunk, maxOutputChars)
       })
+      // The report is parsed from the RAW stream, decoupled from the display truncation below:
+      // a full display buffer must never drop the report line, or a killed run would be
+      // misread as "never submitted". Accumulation stops once the report is found (and is
+      // capped regardless), so memory stays bounded: the report precedes network I/O, so
+      // pre-report stderr is startup-sized.
       child.stderr.on('data', (chunk) => {
         stderr = appendLimited(stderr, chunk, maxOutputChars)
-        onStderr(stderr)
+        if (!reportFound && rawStderr.length < RAW_STDERR_CAP) {
+          rawStderr += chunk
+          if (onStderr(rawStderr) === true) {
+            reportFound = true
+            rawStderr = ''
+          }
+        }
       })
       child.on('error', (err) => fail(err))
       child.on('close', (code) => {

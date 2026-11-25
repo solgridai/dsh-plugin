@@ -45,6 +45,12 @@ if (cmd === 'sleep') {
   }
   key = key ?? 'mock-generated-key'
 
+  if (args.includes('--noisy')) {
+    // 2KB of stderr noise before the report line: exercises report parsing decoupled from
+    // the display truncation cap.
+    process.stderr.write(`${'x'.repeat(2048)}\n`)
+  }
+
   /** @type {number | undefined} */
   let wait
   for (let i = 1; i < args.length; i++) {
