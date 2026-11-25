@@ -71,10 +71,10 @@ function isNegativeNumber(token) {
 /**
  * Strip root-level (global) options the way the CLI's commander program parses them: `--lang <code>`
  * (its value is consumed unconditionally, even when option-like), `--lang=<code>`, and
- * `-v`/`--version` are extracted from anywhere before the `--` separator — even between a
- * subcommand's own arguments — leaving the subcommand's token sequence. Every kept token carries
- * its original index. `--help`/`-h` are NOT global: after a subcommand name they trigger that
- * subcommand's help.
+ * `-v`/`--version` are extracted from anywhere until the `--` separator. At `--`, stripping stops
+ * and the separator plus everything after it pass through verbatim — the subcommand scanner then
+ * decides whether that `--` is an option's value (e.g. `run -o --`) or a real separator. Every kept
+ * token carries its original index.
  * @param {readonly string[]} args
  * @returns {{ text: string, index: number }[]}
  */
@@ -84,8 +84,8 @@ export function localTokens(args) {
   for (let i = 0; i < args.length; i++) {
     const token = args[i]
     if (token === '--') {
-      tokens.push({ text: token, index: i })
-      return tokens // the separator and everything after it stay: operand territory
+      for (let j = i; j < args.length; j++) tokens.push({ text: args[j], index: j })
+      return tokens
     }
     if (token === '--lang') {
       i++ // commander consumes the next token unconditionally as the language code
@@ -172,19 +172,6 @@ export function* scanOptionOccurrences(args) {
     }
     // operand (subcommand name or stray value): nothing to track
   }
-}
-
-/**
- * Return the index of the `--` operand separator, or -1. A `--` consumed as another option's
- * value (e.g. `run -o --`) does not count as a separator.
- * @param {readonly string[]} args
- * @returns {number}
- */
-export function separatorIndex(args) {
-  for (const occ of scanOptionOccurrences(args)) {
-    if (occ.name === '--') return occ.index
-  }
-  return -1
 }
 
 /**
@@ -343,17 +330,26 @@ export function parseSkillMarkdown(raw) {
 }
 
 /**
- * Return the first positional token (the CLI subcommand) after global options are stripped, e.g.
- * `--lang zh run ...` or `run ... --lang en ...` both resolve to `run`.
+ * Return the subcommand token (the first positional) with its index, after global options are
+ * stripped, e.g. `--lang zh run ...` resolves to `run` at its original position.
+ * @param {readonly string[]} args
+ * @returns {{ text: string, index: number } | undefined}
+ */
+export function subcommandPosition(args) {
+  if (!Array.isArray(args)) return undefined
+  for (const { text, index } of localTokens(args)) {
+    if (!text.startsWith('-')) return { text, index }
+  }
+  return undefined
+}
+
+/**
+ * Return the first positional token (the CLI subcommand), or undefined.
  * @param {readonly string[]} args
  * @returns {string | undefined}
  */
 export function firstPositionalCommand(args) {
-  if (!Array.isArray(args)) return undefined
-  for (const { text } of localTokens(args)) {
-    if (!text.startsWith('-')) return text
-  }
-  return undefined
+  return subcommandPosition(args)?.text
 }
 
 /**
@@ -369,34 +365,23 @@ export function isLoginCommand(args) {
 }
 
 /**
- * Return true when CLI arguments invoke the paid `run` command (excluding help requests).
+ * Return true when CLI arguments invoke the paid `run` command. No help exclusion: prepending a
+ * key into `run --help` is harmless (help exits before any submission), while skipping a real
+ * run on a misread help flag (e.g. `run -o --help`, where --help is a file name) would lose the
+ * recovery key entirely.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function isRunCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
-  if (hasHelpRequest(args)) return false
   return firstPositionalCommand(args) === 'run'
-}
-
-/**
- * Extract the effective `--idempotency-key` (last occurrence wins, like the CLI).
- * @param {readonly string[]} args
- * @returns {string | null | undefined} the key; `null` when present but empty/missing (the CLI
- *   rejects it with USAGE, so nothing is submitted); `undefined` when not provided at all.
- */
-export function extractIdempotencyKey(args) {
-  const occ = lastOption(args, ['--idempotency-key'])
-  if (occ === undefined) return undefined
-  if (occ.value === null || occ.value === '') return null
-  return occ.value
 }
 
 /**
  * Extract the effective `--wait` budget in seconds (last occurrence wins, like the CLI).
  * Handles `--wait 30`, `--wait=30`, `-w 30`, `-w30`, bare `--wait` (default 300) and combined short
- * groups like `-jw600`. A non-numeric value returns `undefined` — the CLI fails that invocation
- * with a usage error before submitting anything, so no timeout extension is needed.
+ * groups like `-jw600`. Best-effort: a non-numeric value or an undetected spelling only lowers the
+ * timeout floor — the injected idempotency key keeps the run recoverable either way.
  * @param {readonly string[]} args
  * @returns {number | undefined}
  */
@@ -421,33 +406,25 @@ export function hasOutputOption(args) {
 }
 
 /**
- * Prepare CLI arguments for execution: for `run` commands without an explicit key, append a freshly
- * generated `--idempotency-key` so a tool-level timeout can still point at the exact run (the CLI's
- * own generated key lives only in the child's memory and dies with it). A present-but-empty key is
- * left untouched — the CLI rejects it with USAGE before submitting anything. Also reports the
- * effective wait budget (declared, or implied by `-o`), computed for every `run` regardless of the
- * key branch.
+ * Prepare CLI arguments for execution: `run` commands get a freshly generated `--idempotency-key`
+ * PREPENDED right after the subcommand name, unconditionally. The CLI resolves repeated keys by
+ * last-wins, so an explicit key later in the command always overrides ours — "inject only when
+ * absent" implemented by the CLI's own parser instead of a plugin-side reimplementation. An
+ * explicit empty key likewise stays effective and is rejected with USAGE, exactly as without us.
+ * Also reports the effective wait budget (declared, or implied by `-o`), best-effort.
  * @param {readonly string[]} args
  * @returns {{ cliArgs: readonly string[], idempotencyKey: string | undefined, waitSeconds: number | undefined }}
  */
 export function prepareRunInvocation(args) {
+  const waitSeconds = extractWaitSeconds(args)
   if (!isRunCommand(args)) {
-    return { cliArgs: args, idempotencyKey: undefined, waitSeconds: extractWaitSeconds(args) }
-  }
-  const waitSeconds = extractWaitSeconds(args) ?? (hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined)
-  const existing = extractIdempotencyKey(args)
-  if (existing !== undefined) {
-    return { cliArgs: args, idempotencyKey: existing === null ? undefined : existing, waitSeconds }
+    return { cliArgs: args, idempotencyKey: undefined, waitSeconds }
   }
   const idempotencyKey = randomUUID()
-  // Insert before the `--` operand separator (a trailing option would land among the operands
-  // and make the CLI fail with "too many arguments"); append at the end otherwise.
-  const at = separatorIndex(args) === -1 ? args.length : separatorIndex(args)
-  return {
-    cliArgs: [...args.slice(0, at), '--idempotency-key', idempotencyKey, ...args.slice(at)],
-    idempotencyKey,
-    waitSeconds,
-  }
+  const at = subcommandPosition(args)?.index ?? 0
+  const cliArgs = [...args.slice(0, at + 1), '--idempotency-key', idempotencyKey, ...args.slice(at + 1)]
+  const implied = hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined
+  return { cliArgs, idempotencyKey, waitSeconds: waitSeconds ?? implied }
 }
 
 /**
@@ -478,7 +455,9 @@ export function extractRunId(output) {
 
 /**
  * Build a WAIT_TIMEOUT-style recovery notice for a `run` cut off by the tool-level timeout,
- * mirroring the CLI's own error contract (idempotency key, run ID, follow-up commands).
+ * mirroring the CLI's own error contract (idempotency key, run ID, follow-up commands). The key
+ * is the one this tool prepended; when the command carried its own --idempotency-key, that key
+ * (its last occurrence) is the effective one and the notice says so.
  * @param {{ timeoutMs: number, idempotencyKey: string | undefined, runId?: string | undefined }} info
  * @returns {string | undefined}
  */
@@ -488,16 +467,17 @@ export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
   /** @type {string[]} */
   const lines = [
     `WAIT_TIMEOUT: the solgrid tool stopped the CLI after ~${seconds}s, before it could report the outcome.`,
-    'The run may still be running (or already finished) on Solgrid and may be billed. Do not resubmit it with a new idempotency key.',
+    'The run may still be running (or already finished) on Solgrid and may be billed. Do not resubmit a modified command.',
   ]
   if (runId !== undefined) {
     lines.push(`runId: ${runId}`, `Check it with: solgrid runs get -r ${runId} --wait --json`)
   }
   if (idempotencyKey !== undefined) {
     lines.push(
-      `idempotencyKey: ${idempotencyKey}`,
+      `idempotencyKey: ${idempotencyKey} (auto-injected by this tool)`,
       `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
-      `Or retry the same run safely by adding: --idempotency-key ${idempotencyKey}`,
+      'If the command passed its own --idempotency-key, its last occurrence is the effective key — use that one instead.',
+      'A NOT_FOUND answer means nothing was accepted; re-running the identical command is then safe.',
     )
   }
   return lines.join('\n')

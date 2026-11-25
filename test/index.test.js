@@ -10,7 +10,6 @@ import {
   buildCliEnv,
   buildTimeoutNotice,
   createAbortError,
-  extractIdempotencyKey,
   extractRunId,
   extractWaitSeconds,
   firstPositionalCommand,
@@ -22,7 +21,6 @@ import {
   parseSkillMarkdown,
   prepareRunInvocation,
   resolveTimeoutMs,
-  separatorIndex,
 } from '../index.js'
 
 const mockCliPath = fileURLToPath(new URL('./fixtures/mock-cli.js', import.meta.url))
@@ -147,7 +145,7 @@ describe('isLoginCommand', () => {
 })
 
 describe('run invocation preparation', () => {
-  it('strips global options from anywhere, keeping original indices', () => {
+  it('strips global options anywhere until --, then passes the rest verbatim', () => {
     // --lang <code> is extracted by the root program even between subcommand arguments
     const local = localTokens(['run', '-p', 'x', '--lang', 'en', '-e', 'y'])
     assert.deepEqual(
@@ -159,10 +157,11 @@ describe('run invocation preparation', () => {
       [0, 1, 2, 5, 6],
     )
     assert.deepEqual(localTokens(['run', '--lang=en', '-v', '--json']).map((t) => t.text), ['run', '--json'])
-    // after the separator, --lang is operand territory: kept untouched
+    // at -- stripping stops; the separator and everything after pass through verbatim — the
+    // subcommand scanner decides whether that -- is a value (e.g. -o --) or a separator
     assert.deepEqual(
       localTokens(['run', '--', '--lang', 'en']).map((t) => t.text),
-      ['run', '--'],
+      ['run', '--', '--lang', 'en'],
     )
   })
 
@@ -174,10 +173,11 @@ describe('run invocation preparation', () => {
     assert.equal(firstPositionalCommand([]), undefined)
   })
 
-  it('detects run commands but not help or look-alikes', () => {
+  it('detects run commands, including ones whose --help is merely a value', () => {
     assert.equal(isRunCommand(['run', '-p', 'x', '-e', 'y']), true)
     assert.equal(isRunCommand(['--lang', 'zh', 'run', '--json']), true)
-    assert.equal(isRunCommand(['run', '--help']), false)
+    assert.equal(isRunCommand(['run', '-o', '--help']), true) // --help is the output file name
+    assert.equal(isRunCommand(['run', '--help']), true) // prepending is harmless: help exits first
     assert.equal(isRunCommand(['discover', '-q', 'run']), false)
     assert.equal(isRunCommand([]), false)
   })
@@ -188,59 +188,16 @@ describe('run invocation preparation', () => {
     assert.equal(hasHelpRequest(['run', '-ho']), true) // -h flag followed by -o
     assert.equal(hasHelpRequest(['run', '-o', '--help']), false) // output file named "--help"
     assert.equal(hasHelpRequest(['run', '--output', '--help']), false)
-    assert.equal(hasHelpRequest(['run', '--idempotency-key', '--help']), false) // key named "--help"
     assert.equal(hasHelpRequest(['run', '-i', '-h']), false)
     assert.equal(hasHelpRequest(['run', '--', '--help']), false) // operand after separator
   })
 
-  it('treats runs whose --help is merely a value as paid runs', () => {
-    assert.equal(isRunCommand(['run', '-o', '--help']), true)
-    assert.equal(isRunCommand(['run', '--idempotency-key', '--help']), true)
-    assert.equal(isRunCommand(['run', '--help']), false)
-    assert.equal(isRunCommand(['run', '-h']), false)
-  })
-
-  it('finds separator positions, skipping -- consumed as values', () => {
-    assert.equal(separatorIndex(['run', '-p', 'x', '--', 'operand']), 3)
-    assert.equal(separatorIndex(['run', '-o', '--']), -1) // -- is the output file name
-    assert.equal(separatorIndex(['run', '--wait', '--']), 2)
-    assert.equal(separatorIndex(['run']), -1)
-  })
-
-  it('extracts the effective key when global options interleave subcommand arguments', () => {
-    // The root program extracts `--lang en` first; --idempotency-key then consumes actual-key.
-    const interleaved = ['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json']
-    assert.equal(extractIdempotencyKey(interleaved), 'actual-key')
-    const prepared = prepareRunInvocation(interleaved)
-    assert.equal(prepared.idempotencyKey, 'actual-key')
-    assert.deepEqual(prepared.cliArgs, interleaved) // explicit key: no injection, args untouched
-
-    assert.equal(
-      extractIdempotencyKey(['run', '-o', '--lang', 'en', 'out.json', '--idempotency-key', 'k']),
-      'k',
-    )
-  })
-
-  it('extracts explicit idempotency keys in both spellings, last occurrence wins', () => {
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key', 'k1']), 'k1')
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=k2']), 'k2')
-    assert.equal(
-      extractIdempotencyKey(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual']),
-      'actual',
-    )
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=a', '--idempotency-key', 'b']), 'b')
-    assert.equal(
-      extractIdempotencyKey(['run', '-i', '{"x":"--idempotency-key=trap"}', '--idempotency-key', 'k3']),
-      'k3',
-    )
-    assert.equal(extractIdempotencyKey(['run', '--', '--idempotency-key', 'k']), undefined)
-    assert.equal(extractIdempotencyKey(['discover', '-q', 'twitter']), undefined)
-  })
-
-  it('reports a present-but-empty key as null instead of absent', () => {
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key', '']), null)
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=']), null)
-    assert.equal(extractIdempotencyKey(['run', '--idempotency-key']), null) // CLI errors: argument missing
+  it('reads wait budgets across a -- consumed as an option value', () => {
+    // Round-4 shape: -o eats the --, so --wait stays a live option for the CLI.
+    assert.equal(extractWaitSeconds(['run', '-p', 'x', '-e', 'y', '-o', '--', '--wait', '30', '--json']), 30)
+    assert.equal(hasOutputOption(['run', '-o', '--', '--json']), true)
+    // a real separator still ends option parsing
+    assert.equal(extractWaitSeconds(['run', '-p', 'x', '--', '--wait', '9']), undefined)
   })
 
   it('extracts wait budgets in all spellings, last occurrence wins', () => {
@@ -292,42 +249,87 @@ describe('run invocation preparation', () => {
     assert.equal(hasOutputOption(['run', '-i', '{"o":"-o"}']), false)
   })
 
-  it('injects a fresh idempotency key only for run commands lacking one', () => {
+  it('prepends a generated idempotency key after the subcommand name, unconditionally', () => {
     const injected = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--wait', '30'])
     assert.ok(injected.idempotencyKey !== undefined)
     assert.match(injected.idempotencyKey, /^[0-9a-f-]{36}$/)
-    assert.deepEqual(injected.cliArgs.slice(0, -2), ['run', '-p', 'x', '-e', 'y', '--wait', '30'])
-    assert.deepEqual(injected.cliArgs.slice(-2), ['--idempotency-key', injected.idempotencyKey])
+    assert.deepEqual(injected.cliArgs, [
+      'run',
+      '--idempotency-key',
+      injected.idempotencyKey,
+      '-p',
+      'x',
+      '-e',
+      'y',
+      '--wait',
+      '30',
+    ])
     assert.equal(injected.waitSeconds, 30)
 
-    const kept = prepareRunInvocation(['run', '--idempotency-key', 'mine'])
-    assert.equal(kept.idempotencyKey, 'mine')
-    assert.deepEqual(kept.cliArgs, ['run', '--idempotency-key', 'mine'])
-
-    const lastWins = prepareRunInvocation(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
-    assert.equal(lastWins.idempotencyKey, 'actual')
-    assert.deepEqual(lastWins.cliArgs, ['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
+    // after global options, the key lands right after the subcommand name
+    const withLang = prepareRunInvocation(['--lang', 'zh', 'run', '--json'])
+    assert.deepEqual(withLang.cliArgs, ['--lang', 'zh', 'run', '--idempotency-key', withLang.idempotencyKey, '--json'])
 
     const untouched = prepareRunInvocation(['discover', '-q', 'twitter', '--json'])
     assert.equal(untouched.idempotencyKey, undefined)
     assert.deepEqual(untouched.cliArgs, ['discover', '-q', 'twitter', '--json'])
   })
 
-  it('does not replace an explicit empty key — the CLI must reject it untouched', () => {
-    const empty = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
-    assert.equal(empty.idempotencyKey, undefined)
-    assert.deepEqual(empty.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
+  it('lets the CLI resolve key precedence: an explicit key always overrides the injected one', () => {
+    // commander last-wins: the agent's later key is the effective one (probed against the CLI)
+    const explicit = prepareRunInvocation(['run', '--idempotency-key', 'mine'])
+    assert.deepEqual(explicit.cliArgs, ['run', '--idempotency-key', explicit.idempotencyKey, '--idempotency-key', 'mine'])
 
-    const trailing = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key'])
-    assert.equal(trailing.idempotencyKey, undefined)
-    assert.deepEqual(trailing.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key'])
+    const lastWins = prepareRunInvocation(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
+    assert.deepEqual(lastWins.cliArgs, [
+      'run',
+      '--idempotency-key',
+      lastWins.idempotencyKey,
+      '--idempotency-key',
+      'old',
+      '--idempotency-key',
+      'actual',
+    ])
+
+    // an explicit empty key stays effective (last) and is rejected by the CLI with USAGE
+    const empty = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
+    assert.deepEqual(empty.cliArgs, ['run', '--idempotency-key', empty.idempotencyKey, '-p', 'x', '-e', 'y', '--idempotency-key', ''])
+
+    // interleaved globals and a -- consumed as -o's value: the agent's key is still last-wins
+    const interleaved = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json'])
+    assert.deepEqual(interleaved.cliArgs.slice(3), ['-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json'])
+
+    const round4 = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-o', '--', '--idempotency-key', 'retry-key', '--json'])
+    assert.deepEqual(round4.cliArgs, [
+      'run',
+      '--idempotency-key',
+      round4.idempotencyKey,
+      '-p',
+      'x',
+      '-e',
+      'y',
+      '-o',
+      '--',
+      '--idempotency-key',
+      'retry-key',
+      '--json',
+    ])
   })
 
-  it('applies the -o implied wait with an explicit key and with combined shorts', () => {
-    const withKey = prepareRunInvocation(['run', '-o', 'out.json', '--idempotency-key', 'known'])
-    assert.equal(withKey.idempotencyKey, 'known')
-    assert.equal(withKey.waitSeconds, 300)
+  it('prepends before any -- separator, so the key stays an option', () => {
+    const bare = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--'])
+    assert.deepEqual(bare.cliArgs, ['run', '--idempotency-key', bare.idempotencyKey, '-p', 'x', '-e', 'y', '--'])
 
+    const operands = prepareRunInvocation(['run', '--', 'a', 'b'])
+    assert.deepEqual(operands.cliArgs.slice(0, 3), ['run', '--idempotency-key', operands.idempotencyKey])
+    assert.deepEqual(operands.cliArgs.slice(-3), ['--', 'a', 'b'])
+
+    // -o consumes the -- as its value; the prepended key is still a leading option
+    const consumed = prepareRunInvocation(['run', '-o', '--'])
+    assert.deepEqual(consumed.cliArgs, ['run', '--idempotency-key', consumed.idempotencyKey, '-o', '--'])
+  })
+
+  it('applies the -o implied wait with combined shorts and help-as-value', () => {
     const attached = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-oout.json'])
     assert.equal(attached.waitSeconds, 300)
 
@@ -337,23 +339,6 @@ describe('run invocation preparation', () => {
     const helpAsValue = prepareRunInvocation(['run', '-o', '--help'])
     assert.ok(helpAsValue.idempotencyKey !== undefined)
     assert.equal(helpAsValue.waitSeconds, 300)
-  })
-
-  it('inserts the injected key before the -- separator, never after it', () => {
-    const bare = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--'])
-    assert.ok(bare.idempotencyKey !== undefined)
-    assert.deepEqual(bare.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key', bare.idempotencyKey, '--'])
-
-    const operands = prepareRunInvocation(['run', '--', 'a', 'b'])
-    assert.deepEqual(
-      operands.cliArgs.slice(0, 3),
-      ['run', '--idempotency-key', operands.idempotencyKey],
-    )
-    assert.deepEqual(operands.cliArgs.slice(-3), ['--', 'a', 'b'])
-
-    // a -- consumed as another option's value is not a separator: append at the end
-    const consumed = prepareRunInvocation(['run', '-o', '--'])
-    assert.deepEqual(consumed.cliArgs, ['run', '-o', '--', '--idempotency-key', consumed.idempotencyKey])
   })
 
   it('extends the timeout to cover declared wait budgets and clamps below setTimeout overflow', () => {
@@ -376,9 +361,10 @@ describe('run invocation preparation', () => {
     const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: undefined })
     assert.ok(notice !== undefined)
     assert.match(notice, /WAIT_TIMEOUT/)
-    assert.match(notice, /idempotencyKey: key-1/)
+    assert.match(notice, /idempotencyKey: key-1 \(auto-injected by this tool\)/)
     assert.match(notice, /runs get --idempotency-key key-1 --wait --json/)
-    assert.match(notice, /--idempotency-key key-1/)
+    assert.match(notice, /its last occurrence is the effective key/)
+    assert.match(notice, /NOT_FOUND/)
 
     const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: 'abc' })
     assert.ok(withRunId !== undefined)
@@ -550,22 +536,23 @@ describe('solgrid plugin integration', () => {
     }
   })
 
-  it('injects an idempotency key into run commands and passes it to the CLI', async () => {
+  it('prepends the injected idempotency key right after the subcommand name', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
       const res = await tools[0].execute({ args: ['run', '-p', 'x', '-e', 'y', '--json'] }, makeExec())
       assert.equal(res.status, 'ok')
       const parsed = JSON.parse(res.stdout)
-      assert.equal(parsed.args.length, 8)
-      assert.equal(parsed.args[6], '--idempotency-key')
-      assert.match(parsed.args[7], /^[0-9a-f-]{36}$/)
+      assert.equal(parsed.args[0], 'run')
+      assert.equal(parsed.args[1], '--idempotency-key')
+      assert.match(parsed.args[2], /^[0-9a-f-]{36}$/)
+      assert.deepEqual(parsed.args.slice(3), ['-p', 'x', '-e', 'y', '--json'])
     } finally {
       dispose()
     }
   })
 
-  it('keeps an explicit idempotency key untouched', async () => {
+  it('leaves an explicit key in place — the CLI last-wins resolves it over the injected one', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
@@ -575,7 +562,10 @@ describe('solgrid plugin integration', () => {
       )
       assert.equal(res.status, 'ok')
       const parsed = JSON.parse(res.stdout)
-      assert.deepEqual(parsed.args, ['run', '--idempotency-key', 'agent-key-1'])
+      assert.equal(parsed.args[0], 'run')
+      assert.equal(parsed.args[1], '--idempotency-key')
+      assert.match(parsed.args[2], /^[0-9a-f-]{36}$/)
+      assert.deepEqual(parsed.args.slice(3), ['--idempotency-key', 'agent-key-1'])
     } finally {
       dispose()
     }
@@ -620,32 +610,45 @@ describe('solgrid plugin integration', () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
+      // The hint names the injected key and points at the command's own key when present —
+      // the CLI resolves agent-key-2 as the effective key via last-wins.
       const res = await tools[0].execute(
         { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
         makeExec(),
       )
       assert.equal(res.status, 'timeout')
-      assert.match(res.hint, /idempotencyKey: agent-key-2/)
+      assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36} \(auto-injected by this tool\)/)
+      assert.match(res.hint, /its last occurrence is the effective key/)
     } finally {
       dispose()
     }
   })
 
-  it('names the effective key when global options interleave the run arguments', async () => {
-    // CLI: root extracts `--lang en`, so --idempotency-key submits with agent-key-3.
+  it('recovers runs whose global options interleave or whose -- is a value', async () => {
+    // Round-3 and round-4 shapes: the injected key leads, the agent's key stays effective.
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
-      const res = await tools[0].execute(
+      const interleaved = await tools[0].execute(
         {
           args: ['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'agent-key-3', '--hang'],
           timeoutMs: 150,
         },
         makeExec(),
       )
-      assert.equal(res.status, 'timeout')
-      assert.match(res.hint, /idempotencyKey: agent-key-3/)
-      assert.doesNotMatch(res.hint, /idempotencyKey: --lang/)
+      assert.equal(interleaved.status, 'timeout')
+      assert.match(interleaved.hint, /idempotencyKey: [0-9a-f-]{36}/)
+      assert.match(interleaved.hint, /its last occurrence is the effective key/)
+
+      const asValue = await tools[0].execute(
+        {
+          args: ['run', '-p', '--', '-e', 'y', '--idempotency-key', 'agent-key-4', '--hang'],
+          timeoutMs: 150,
+        },
+        makeExec(),
+      )
+      assert.equal(asValue.status, 'timeout')
+      assert.match(asValue.hint, /idempotencyKey: [0-9a-f-]{36}/)
     } finally {
       dispose()
     }
