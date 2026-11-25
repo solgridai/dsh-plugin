@@ -69,43 +69,76 @@ function isNegativeNumber(token) {
 }
 
 /**
+ * Strip root-level (global) options the way the CLI's commander program parses them: `--lang <code>`
+ * (its value is consumed unconditionally, even when option-like), `--lang=<code>`, and
+ * `-v`/`--version` are extracted from anywhere before the `--` separator — even between a
+ * subcommand's own arguments — leaving the subcommand's token sequence. Every kept token carries
+ * its original index. `--help`/`-h` are NOT global: after a subcommand name they trigger that
+ * subcommand's help.
+ * @param {readonly string[]} args
+ * @returns {{ text: string, index: number }[]}
+ */
+export function localTokens(args) {
+  /** @type {Array<{ text: string, index: number }>} */
+  const tokens = []
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '--') {
+      tokens.push({ text: token, index: i })
+      return tokens // the separator and everything after it stay: operand territory
+    }
+    if (token === '--lang') {
+      i++ // commander consumes the next token unconditionally as the language code
+      continue
+    }
+    if (token.startsWith('--lang=')) continue
+    if (token === '--version' || token === '-v') continue
+    tokens.push({ text: token, index: i })
+  }
+  return tokens
+}
+
+/**
  * Scan CLI arguments the way the CLI's commander setup parses them, yielding one occurrence per
- * tracked option: long `--name value` / `--name=value`, short groups `-abc` where the first
- * value-taking char consumes the rest of the token as its raw value (no `=` stripping),
- * two-token shorts, and the `--` separator (yielded as name `'--'`, after which scanning stops).
- * Every occurrence carries the index of its option token. Repeated options yield repeatedly —
+ * tracked option: root-level global options are stripped first (see `localTokens`), then long
+ * `--name value` / `--name=value`, short groups `-abc` where the first value-taking char consumes
+ * the rest of the token as its raw value (no `=` stripping), two-token shorts, and the `--`
+ * separator (yielded as name `'--'`, after which scanning stops). Every occurrence carries the
+ * index of its option token in the original arguments. Repeated options yield repeatedly —
  * commander keeps the LAST assignment, so callers must too.
  * @param {readonly string[]} args
  * @yields {{ name: string, value: string | null, index: number }}
  */
 export function* scanOptionOccurrences(args) {
   if (!Array.isArray(args)) return
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
+  const tokens = localTokens(args)
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i].text
+    const index = tokens[i].index
     if (token === '--') {
-      yield { name: '--', value: null, index: i }
+      yield { name: '--', value: null, index }
       return // everything after -- is an operand
     }
     if (token.startsWith('--')) {
       const eq = token.indexOf('=')
       if (eq !== -1) {
-        yield { name: token.slice(0, eq), value: token.slice(eq + 1), index: i }
+        yield { name: token.slice(0, eq), value: token.slice(eq + 1), index }
         continue
       }
       if (LONG_VALUE_OPTIONS.has(token)) {
-        const next = args[i + 1] // commander consumes the next token unconditionally
+        const next = tokens[i + 1] // commander consumes the next token unconditionally
         if (next !== undefined) i++
-        yield { name: token, value: next !== undefined ? next : null, index: i }
+        yield { name: token, value: next !== undefined ? next.text : null, index }
       } else if (token === '--wait') {
-        const next = args[i + 1]
-        if (next !== undefined && (!isOptionLike(next) || isNegativeNumber(next))) {
+        const next = tokens[i + 1]
+        if (next !== undefined && (!isOptionLike(next.text) || isNegativeNumber(next.text))) {
           i++
-          yield { name: token, value: next, index: i }
+          yield { name: token, value: next.text, index }
         } else {
-          yield { name: token, value: null, index: i } // bare flag
+          yield { name: token, value: null, index } // bare flag
         }
       } else {
-        yield { name: token, value: null, index: i } // boolean flag
+        yield { name: token, value: null, index } // boolean flag
       }
       continue
     }
@@ -115,22 +148,22 @@ export function* scanOptionOccurrences(args) {
         const char = rest[0]
         rest = rest.slice(1)
         if (!SHORT_VALUE_OPTIONS.has(char)) {
-          yield { name: `-${char}`, value: null, index: i } // boolean (or unknown; the CLI will reject it)
+          yield { name: `-${char}`, value: null, index } // boolean (or unknown; the CLI will reject it)
           continue
         }
         if (rest !== '') {
-          yield { name: `-${char}`, value: rest, index: i } // attached value, kept raw like commander
+          yield { name: `-${char}`, value: rest, index } // attached value, kept raw like commander
         } else {
-          const next = args[i + 1]
+          const next = tokens[i + 1]
           const takes =
             char === 'w'
-              ? next !== undefined && (!isOptionLike(next) || isNegativeNumber(next))
+              ? next !== undefined && (!isOptionLike(next.text) || isNegativeNumber(next.text))
               : next !== undefined
           if (takes) {
             i++
-            yield { name: `-${char}`, value: next, index: i }
+            yield { name: `-${char}`, value: next !== undefined ? next.text : null, index }
           } else {
-            yield { name: `-${char}`, value: null, index: i }
+            yield { name: `-${char}`, value: null, index }
           }
         }
         break // a value-taking char ends the group
@@ -310,20 +343,15 @@ export function parseSkillMarkdown(raw) {
 }
 
 /**
- * Return the first positional token (the CLI subcommand), skipping global options such as `--lang zh`.
+ * Return the first positional token (the CLI subcommand) after global options are stripped, e.g.
+ * `--lang zh run ...` or `run ... --lang en ...` both resolve to `run`.
  * @param {readonly string[]} args
  * @returns {string | undefined}
  */
 export function firstPositionalCommand(args) {
   if (!Array.isArray(args)) return undefined
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
-    if (token === '--lang') {
-      i++ // skip the option value
-      continue
-    }
-    if (token.startsWith('-')) continue
-    return token
+  for (const { text } of localTokens(args)) {
+    if (!text.startsWith('-')) return text
   }
   return undefined
 }

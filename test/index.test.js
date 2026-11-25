@@ -18,6 +18,7 @@ import {
   hasOutputOption,
   isLoginCommand,
   isRunCommand,
+  localTokens,
   parseSkillMarkdown,
   prepareRunInvocation,
   resolveTimeoutMs,
@@ -146,9 +147,29 @@ describe('isLoginCommand', () => {
 })
 
 describe('run invocation preparation', () => {
+  it('strips global options from anywhere, keeping original indices', () => {
+    // --lang <code> is extracted by the root program even between subcommand arguments
+    const local = localTokens(['run', '-p', 'x', '--lang', 'en', '-e', 'y'])
+    assert.deepEqual(
+      local.map((t) => t.text),
+      ['run', '-p', 'x', '-e', 'y'],
+    )
+    assert.deepEqual(
+      local.map((t) => t.index),
+      [0, 1, 2, 5, 6],
+    )
+    assert.deepEqual(localTokens(['run', '--lang=en', '-v', '--json']).map((t) => t.text), ['run', '--json'])
+    // after the separator, --lang is operand territory: kept untouched
+    assert.deepEqual(
+      localTokens(['run', '--', '--lang', 'en']).map((t) => t.text),
+      ['run', '--'],
+    )
+  })
+
   it('finds the subcommand after global options', () => {
     assert.equal(firstPositionalCommand(['--lang', 'zh', 'run', '-p', 'x']), 'run')
     assert.equal(firstPositionalCommand(['--lang=zh', 'whoami']), 'whoami')
+    assert.equal(firstPositionalCommand(['run', '--lang', 'en', 'discover']), 'run')
     assert.equal(firstPositionalCommand(['discover', '-q', 'twitter']), 'discover')
     assert.equal(firstPositionalCommand([]), undefined)
   })
@@ -184,6 +205,20 @@ describe('run invocation preparation', () => {
     assert.equal(separatorIndex(['run', '-o', '--']), -1) // -- is the output file name
     assert.equal(separatorIndex(['run', '--wait', '--']), 2)
     assert.equal(separatorIndex(['run']), -1)
+  })
+
+  it('extracts the effective key when global options interleave subcommand arguments', () => {
+    // The root program extracts `--lang en` first; --idempotency-key then consumes actual-key.
+    const interleaved = ['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json']
+    assert.equal(extractIdempotencyKey(interleaved), 'actual-key')
+    const prepared = prepareRunInvocation(interleaved)
+    assert.equal(prepared.idempotencyKey, 'actual-key')
+    assert.deepEqual(prepared.cliArgs, interleaved) // explicit key: no injection, args untouched
+
+    assert.equal(
+      extractIdempotencyKey(['run', '-o', '--lang', 'en', 'out.json', '--idempotency-key', 'k']),
+      'k',
+    )
   })
 
   it('extracts explicit idempotency keys in both spellings, last occurrence wins', () => {
@@ -232,6 +267,13 @@ describe('run invocation preparation', () => {
     assert.equal(extractWaitSeconds(['run', '--wait=0']), undefined)
     assert.equal(extractWaitSeconds(['run', '--wait=']), undefined)
     assert.equal(extractWaitSeconds(['run', '--wait', '-5']), undefined)
+  })
+
+  it('reads wait budgets across interleaved global options like the CLI', () => {
+    // `--wait --lang en 600`: the root program strips `--lang en`, so --wait consumes 600.
+    assert.equal(extractWaitSeconds(['run', '-p', 'x', '-e', 'y', '--wait', '--lang', 'en', '600', '--json']), 600)
+    assert.equal(extractWaitSeconds(['run', '--wait', '--lang', 'en', 'abc']), undefined)
+    assert.equal(extractWaitSeconds(['run', '--lang=en', '--wait', '5']), 5)
   })
 
   it('understands combined short groups and rejects values the CLI rejects', () => {
@@ -584,6 +626,26 @@ describe('solgrid plugin integration', () => {
       )
       assert.equal(res.status, 'timeout')
       assert.match(res.hint, /idempotencyKey: agent-key-2/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('names the effective key when global options interleave the run arguments', async () => {
+    // CLI: root extracts `--lang en`, so --idempotency-key submits with agent-key-3.
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      const res = await tools[0].execute(
+        {
+          args: ['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'agent-key-3', '--hang'],
+          timeoutMs: 150,
+        },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.match(res.hint, /idempotencyKey: agent-key-3/)
+      assert.doesNotMatch(res.hint, /idempotencyKey: --lang/)
     } finally {
       dispose()
     }
