@@ -177,22 +177,31 @@ describe('buildRunEnv', () => {
 })
 
 describe('parseRunReport', () => {
-  it('parses the full report line', () => {
-    assert.deepEqual(parseRunReport('solgrid: idempotencyKey=abc wait=30\n'), {
+  it('parses the JSON report line', () => {
+    assert.deepEqual(parseRunReport('solgrid: {"idempotencyKey":"abc","wait":30}\n'), {
       idempotencyKey: 'abc',
       waitSeconds: 30,
     })
   })
 
+  it('carries keys with spaces and = losslessly, exactly like the CLI writes them', () => {
+    assert.deepEqual(parseRunReport('solgrid: {"idempotencyKey":"job wait=1","wait":30}'), {
+      idempotencyKey: 'job wait=1',
+      waitSeconds: 30,
+    })
+  })
+
   it('parses wait-only reports and finds the line among other output', () => {
-    assert.deepEqual(parseRunReport('noise\nsolgrid: wait=300\nmore noise'), {
+    assert.deepEqual(parseRunReport('noise\nsolgrid: {"wait":300}\nmore noise'), {
       idempotencyKey: undefined,
       waitSeconds: 300,
     })
   })
 
-  it('ignores other solgrid lines, garbage and empty text', () => {
+  it('ignores truncated lines, other solgrid lines, garbage and empty text', () => {
+    assert.equal(parseRunReport('solgrid: {"idempotencyKey":"ab'), undefined) // split chunk
     assert.equal(parseRunReport('solgrid: update available 0.7.0\n'), undefined)
+    assert.equal(parseRunReport('solgrid: not json\n'), undefined)
     assert.equal(parseRunReport('Error: nope\n'), undefined)
     assert.equal(parseRunReport(''), undefined)
   })
@@ -465,7 +474,7 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'timeout')
       assert.equal(res.exitCode, 1)
       assert.equal(res.stdout, '')
-      assert.match(res.stderr, /^solgrid: idempotencyKey=[0-9a-f-]{36}$/)
+      assert.match(res.stderr, /^solgrid: \{"idempotencyKey":"[0-9a-f-]{36}"\}$/)
       assert.match(res.hint, /WAIT_TIMEOUT/)
       assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36}/)
       assert.match(res.hint, /runs get --idempotency-key [0-9a-f-]{36} --wait --json/)
@@ -484,7 +493,8 @@ describe('solgrid plugin integration', () => {
     applyWithCli(ctx, {}, resolved)
     try {
       // The CLI resolves the flag over the preset env key and reports it — even killed, the
-      // hint is exact (flag > env > generated, resolved by the CLI itself).
+      // hint is exact (flag > env > generated, resolved by the CLI itself). Keys containing
+      // spaces round-trip losslessly through the JSON report line.
       const res = await tools[0].execute(
         { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
         makeExec(),
@@ -492,6 +502,13 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'timeout')
       assert.match(res.hint, /idempotencyKey: agent-key-2/)
       assert.doesNotMatch(res.hint, /last occurrence/)
+
+      const spaced = await tools[0].execute(
+        { args: ['run', '--hang', '--idempotency-key', 'job wait=1', '--wait', '30'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(spaced.status, 'timeout')
+      assert.match(spaced.hint, /idempotencyKey: job wait=1/)
     } finally {
       dispose()
     }

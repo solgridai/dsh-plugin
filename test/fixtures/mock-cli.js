@@ -55,13 +55,16 @@ if (cmd === 'sleep') {
     }
   }
 
-  const report = cmd === 'run' ? `solgrid: idempotencyKey=${key}${wait !== undefined ? ` wait=${wait}` : ''}` : `solgrid: wait=${wait ?? 300}`
+  const report =
+    cmd === 'run'
+      ? { idempotencyKey: key, ...(wait !== undefined ? { wait } : {}) }
+      : { wait: wait ?? 300 }
   if (cmd === 'runs' && wait === undefined) {
     // runs get without --wait reports nothing and returns immediately.
     console.log(JSON.stringify({ args }))
     process.exit(0)
   }
-  process.stderr.write(`${report}\n`)
+  process.stderr.write(`solgrid: ${JSON.stringify(report)}\n`)
 
   if (args.includes('--hang')) {
     setTimeout(() => process.exit(0), 60_000)

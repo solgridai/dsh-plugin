@@ -33,27 +33,38 @@ const WAIT_GRACE_MS = 15_000
 const MAX_TIMEOUT_MS = 2_147_483_000
 
 /**
- * Parse the CLI's stderr report line — `solgrid: idempotencyKey=<key> wait=<seconds>` — written
- * by `run` and `runs get --wait` before any network I/O. stderr is not buffered by `--json`, so
- * the line survives a SIGKILL at any point, carrying the CLI's own resolved key and wait budget.
+ * Parse the CLI's stderr report line — `solgrid: {"idempotencyKey":"<key>","wait":<seconds>}` —
+ * written by `run` and `runs get --wait` before any network I/O. The payload is JSON, so keys
+ * with spaces, `=` or even newlines are carried losslessly; stderr is not buffered by `--json`,
+ * so the line survives a SIGKILL at any point, carrying the CLI's own resolved key and wait
+ * budget.
  * @param {string} text accumulated stderr text
  * @returns {{ idempotencyKey: string | undefined, waitSeconds: number | undefined } | undefined}
  */
 export function parseRunReport(text) {
   if (!text) return undefined
-  const line = text.match(/^solgrid: [^\r\n]*/m)?.[0]
+  const line = text.match(/^solgrid: (\{[^\r\n]*\})/m)?.[1]
   if (line === undefined) return undefined
-  const idempotencyKey = line.match(/(?:^|\s)idempotencyKey=(\S+)/)?.[1]
-  const waitSeconds = line.match(/(?:^|\s)wait=(\d+)/)?.[1]
-  if (idempotencyKey === undefined && waitSeconds === undefined) return undefined
-  return { idempotencyKey, waitSeconds: waitSeconds !== undefined ? Number(waitSeconds) : undefined }
+  try {
+    const report = JSON.parse(line)
+    if (report === null || typeof report !== 'object' || Array.isArray(report)) return undefined
+    const idempotencyKey =
+      typeof report.idempotencyKey === 'string' && report.idempotencyKey !== ''
+        ? report.idempotencyKey
+        : undefined
+    const waitSeconds = typeof report.wait === 'number' && report.wait >= 1 ? report.wait : undefined
+    if (idempotencyKey === undefined && waitSeconds === undefined) return undefined
+    return { idempotencyKey, waitSeconds }
+  } catch {
+    return undefined
+  }
 }
 
 const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use the built-in \`solgrid\` tool instead of running \`solgrid\` through \`bash\`. Pass CLI arguments as the \`args\` array (for example \`{ "args": ["discover", "-q", "twitter user profile", "--json"] }\`). The CLI is bundled with this plugin, so no separate installation is needed.
 >
 > For device-code login, call \`solgrid\` with \`{ "args": ["login", "--json"] }\`: it returns the authorization link and code immediately while polling in the background. Relay the link and code to the user; once they approve in their browser, run \`{ "args": ["whoami", "--json"] }\` or re-run the command that failed.
 >
-> Timeouts on paid runs: every \`run\` gets an idempotency key preset via \`SOLGRID_IDEMPOTENCY_KEY\` (an explicit \`--idempotency-key\` in \`args\` always wins), and the CLI reports \`solgrid: idempotencyKey=<key> wait=<seconds>\` on stderr before submitting, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
+> Timeouts on paid runs: every \`run\` gets an idempotency key preset via \`SOLGRID_IDEMPOTENCY_KEY\` (an explicit \`--idempotency-key\` in \`args\` always wins), and the CLI reports \`solgrid: {\"idempotencyKey\":\"<key>\",\"wait\":<seconds>}\` on stderr before submitting, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
 >
 > To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
 
@@ -479,7 +490,7 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       let timer = setTimeout(onTimeout, currentTimeoutMs)
 
       /**
-       * The CLI reports `solgrid: idempotencyKey=<key> wait=<seconds>` on stderr before any
+       * The CLI reports `solgrid: {"idempotencyKey":"<key>","wait":<seconds>}` on stderr before any
        * network I/O. On arrival: remember the exact effective key, and realign the safety net
        * with the reported wait budget (only ever extending it) so the CLI's own WAIT_TIMEOUT —
        * run ID, key and recovery hints included — is what the agent sees, not a hard kill.
