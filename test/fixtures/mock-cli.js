@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Minimal mock CLI for unit tests.
+// Minimal mock CLI for unit tests. Mirrors the real CLI's wrapper-recovery protocol:
+// `--idempotency-key` beats SOLGRID_IDEMPOTENCY_KEY beats a generated key, and
+// `solgrid: idempotencyKey=<key> wait=<seconds>` is written to stderr before any work.
 const args = process.argv.slice(2)
 const cmd = args[0]
 
@@ -28,23 +30,45 @@ if (cmd === 'sleep') {
     console.log('awake')
     process.exit(0)
   }, ms)
-} else if (cmd === 'run') {
-  // Simulate the real CLI: `--wait N` finishes just after the budget; `--hang` stalls forever.
+} else if (cmd === 'run' || (cmd === 'runs' && args[1] === 'get')) {
+  // Key resolution: explicit flag, then the preset env, then generated.
+  let key
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--idempotency-key') {
+      key = args[i + 1]
+      break
+    }
+    if (args[i].startsWith('--idempotency-key=')) {
+      key = args[i].slice('--idempotency-key='.length)
+      break
+    }
+  }
+  key = key ?? process.env.SOLGRID_IDEMPOTENCY_KEY ?? 'mock-generated-key'
+
+  /** @type {number | undefined} */
+  let wait
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--wait' || args[i] === '-w') {
+      wait = /^\d+$/.test(args[i + 1] ?? '') ? Number(args[i + 1]) : 300
+    } else if (args[i].startsWith('--wait=')) {
+      wait = Number(args[i].slice('--wait='.length))
+    }
+  }
+
+  const report = cmd === 'run' ? `solgrid: idempotencyKey=${key}${wait !== undefined ? ` wait=${wait}` : ''}` : `solgrid: wait=${wait ?? 300}`
+  if (cmd === 'runs' && wait === undefined) {
+    // runs get without --wait reports nothing and returns immediately.
+    console.log(JSON.stringify({ args }))
+    process.exit(0)
+  }
+  process.stderr.write(`${report}\n`)
+
   if (args.includes('--hang')) {
     setTimeout(() => process.exit(0), 60_000)
   } else {
-    let waitSeconds
-    for (let i = 1; i < args.length; i++) {
-      if (args[i] === '--wait' || args[i] === '-w') {
-        const next = args[i + 1]
-        waitSeconds = typeof next === 'string' && /^\d+$/.test(next) ? Number(next) : 300
-      } else if (args[i].startsWith('--wait=')) {
-        waitSeconds = Number(args[i].slice('--wait='.length))
-      }
-    }
-    const delay = waitSeconds !== undefined ? waitSeconds * 1000 + 300 : 0
+    const delay = wait !== undefined ? wait * 1000 + 300 : 0
     setTimeout(() => {
-      console.log(JSON.stringify({ args }))
+      console.log(JSON.stringify({ args, ...(cmd === 'run' ? { key, wait: wait ?? null } : {}) }))
       process.exit(0)
     }, delay)
   }

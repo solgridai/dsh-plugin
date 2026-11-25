@@ -8,18 +8,15 @@ import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import {
   applyWithCli,
   buildCliEnv,
+  buildRunEnv,
   buildTimeoutNotice,
   createAbortError,
   extractRunId,
-  extractWaitSeconds,
   firstPositionalCommand,
-  hasHelpRequest,
-  hasOutputOption,
   isLoginCommand,
   isRunCommand,
-  localTokens,
+  parseRunReport,
   parseSkillMarkdown,
-  prepareRunInvocation,
   resolveTimeoutMs,
 } from '../index.js'
 
@@ -130,225 +127,88 @@ describe('parseSkillMarkdown', () => {
   })
 })
 
-describe('isLoginCommand', () => {
-  it('detects login invocations with or without leading flags', () => {
-    assert.equal(isLoginCommand(['login']), true)
-    assert.equal(isLoginCommand(['--lang', 'zh', 'login', '--json']), true)
-  })
-
-  it('ignores help requests and other commands', () => {
-    assert.equal(isLoginCommand(['login', '--help']), false)
-    assert.equal(isLoginCommand(['login', '-h']), false)
-    assert.equal(isLoginCommand(['discover', '-q', 'login']), false)
-    assert.equal(isLoginCommand([]), false)
-  })
-})
-
-describe('run invocation preparation', () => {
-  it('strips global options anywhere until --, then passes the rest verbatim', () => {
-    // --lang <code> is extracted by the root program even between subcommand arguments
-    const local = localTokens(['run', '-p', 'x', '--lang', 'en', '-e', 'y'])
-    assert.deepEqual(
-      local.map((t) => t.text),
-      ['run', '-p', 'x', '-e', 'y'],
-    )
-    assert.deepEqual(
-      local.map((t) => t.index),
-      [0, 1, 2, 5, 6],
-    )
-    assert.deepEqual(localTokens(['run', '--lang=en', '-v', '--json']).map((t) => t.text), ['run', '--json'])
-    // at -- stripping stops; the separator and everything after pass through verbatim — the
-    // subcommand scanner decides whether that -- is a value (e.g. -o --) or a separator
-    assert.deepEqual(
-      localTokens(['run', '--', '--lang', 'en']).map((t) => t.text),
-      ['run', '--', '--lang', 'en'],
-    )
-  })
-
-  it('finds the subcommand after global options', () => {
+describe('command detection', () => {
+  it('finds the subcommand after root-level global options', () => {
     assert.equal(firstPositionalCommand(['--lang', 'zh', 'run', '-p', 'x']), 'run')
     assert.equal(firstPositionalCommand(['--lang=zh', 'whoami']), 'whoami')
-    assert.equal(firstPositionalCommand(['run', '--lang', 'en', 'discover']), 'run')
+    assert.equal(firstPositionalCommand(['-v', 'run', '-p', 'x']), 'run')
     assert.equal(firstPositionalCommand(['discover', '-q', 'twitter']), 'discover')
+    assert.equal(firstPositionalCommand(['run', '--lang', 'en', 'discover']), 'run')
     assert.equal(firstPositionalCommand([]), undefined)
   })
 
-  it('detects run commands, including ones whose --help is merely a value', () => {
+  it('detects login invocations with or without leading flags', () => {
+    assert.equal(isLoginCommand(['login']), true)
+    assert.equal(isLoginCommand(['--lang', 'zh', 'login', '--json']), true)
+    assert.equal(isLoginCommand(['discover', '-q', 'login']), false)
+    assert.equal(isLoginCommand([]), false)
+  })
+
+  it('detects run invocations, including help requests (env is inert on help)', () => {
     assert.equal(isRunCommand(['run', '-p', 'x', '-e', 'y']), true)
     assert.equal(isRunCommand(['--lang', 'zh', 'run', '--json']), true)
-    assert.equal(isRunCommand(['run', '-o', '--help']), true) // --help is the output file name
-    assert.equal(isRunCommand(['run', '--help']), true) // prepending is harmless: help exits first
+    assert.equal(isRunCommand(['run', '--help']), true)
     assert.equal(isRunCommand(['discover', '-q', 'run']), false)
     assert.equal(isRunCommand([]), false)
   })
+})
 
-  it('detects help requests only as real option occurrences, not as values', () => {
-    assert.equal(hasHelpRequest(['run', '--help']), true)
-    assert.equal(hasHelpRequest(['run', '-h']), true)
-    assert.equal(hasHelpRequest(['run', '-ho']), true) // -h flag followed by -o
-    assert.equal(hasHelpRequest(['run', '-o', '--help']), false) // output file named "--help"
-    assert.equal(hasHelpRequest(['run', '--output', '--help']), false)
-    assert.equal(hasHelpRequest(['run', '-i', '-h']), false)
-    assert.equal(hasHelpRequest(['run', '--', '--help']), false) // operand after separator
+describe('buildRunEnv', () => {
+  it('presets SOLGRID_IDEMPOTENCY_KEY only for run invocations', () => {
+    const runEnv = buildRunEnv({}, ['run', '-p', 'x', '-e', 'y'], {})
+    assert.ok(runEnv.SOLGRID_IDEMPOTENCY_KEY !== undefined)
+    assert.match(runEnv.SOLGRID_IDEMPOTENCY_KEY, /^[0-9a-f-]{36}$/)
+    assert.equal(runEnv.ELECTRON_RUN_AS_NODE, '1')
+
+    const otherEnv = buildRunEnv({}, ['discover', '-q', 'twitter'], {})
+    assert.equal(otherEnv.SOLGRID_IDEMPOTENCY_KEY, undefined)
+
+    const first = buildRunEnv({}, ['run'], {}).SOLGRID_IDEMPOTENCY_KEY
+    const second = buildRunEnv({}, ['run'], {}).SOLGRID_IDEMPOTENCY_KEY
+    assert.ok(first !== undefined && second !== undefined)
+    assert.notEqual(first, second)
   })
 
-  it('reads wait budgets across a -- consumed as an option value', () => {
-    // Round-4 shape: -o eats the --, so --wait stays a live option for the CLI.
-    assert.equal(extractWaitSeconds(['run', '-p', 'x', '-e', 'y', '-o', '--', '--wait', '30', '--json']), 30)
-    assert.equal(hasOutputOption(['run', '-o', '--', '--json']), true)
-    // a real separator still ends option parsing
-    assert.equal(extractWaitSeconds(['run', '-p', 'x', '--', '--wait', '9']), undefined)
+  it('carries config overrides and never touches the argument list', () => {
+    const env = buildRunEnv({ apiBaseUrl: 'https://api.example', lang: 'zh' }, ['run'], {})
+    assert.equal(env.SOLGRID_API_BASE_URL, 'https://api.example')
+    assert.equal(env.SOLGRID_LANG, 'zh')
+  })
+})
+
+describe('parseRunReport', () => {
+  it('parses the full report line', () => {
+    assert.deepEqual(parseRunReport('solgrid: idempotencyKey=abc wait=30\n'), {
+      idempotencyKey: 'abc',
+      waitSeconds: 30,
+    })
   })
 
-  it('extracts wait budgets in all spellings, last occurrence wins', () => {
-    assert.equal(extractWaitSeconds(['run', '--wait', '30']), 30)
-    assert.equal(extractWaitSeconds(['run', '--wait=45']), 45)
-    assert.equal(extractWaitSeconds(['run', '-w', '60']), 60)
-    assert.equal(extractWaitSeconds(['run', '-w90']), 90)
-    assert.equal(extractWaitSeconds(['run', '--wait']), 300)
-    assert.equal(extractWaitSeconds(['run', '--wait', '--json']), 300) // next token is an option: bare
-    assert.equal(extractWaitSeconds(['runs', 'get', '-r', 'abc', '--wait', '5']), 5)
-    assert.equal(extractWaitSeconds(['run', '--wait', '600', '--wait', '30']), 30)
-    assert.equal(extractWaitSeconds(['discover']), undefined)
-    // a numeric value of another option must not be misread
-    assert.equal(extractWaitSeconds(['run', '-i', '{"wait":"--wait 9"}']), undefined)
-    assert.equal(extractWaitSeconds(['run', '--', '--wait', '9']), undefined)
+  it('parses wait-only reports and finds the line among other output', () => {
+    assert.deepEqual(parseRunReport('noise\nsolgrid: wait=300\nmore noise'), {
+      idempotencyKey: undefined,
+      waitSeconds: 300,
+    })
   })
 
-  it('parses wait numbers exactly like the CLI parsePositiveInt', () => {
-    assert.equal(extractWaitSeconds(['run', '--wait=600.0']), 600)
-    assert.equal(extractWaitSeconds(['run', '--wait=6e2']), 600)
-    assert.equal(extractWaitSeconds(['run', '--wait', '600.0']), 600)
-    assert.equal(extractWaitSeconds(['run', '--wait=0x254']), 596)
-    assert.equal(extractWaitSeconds(['run', '--wait=abc']), undefined)
-    assert.equal(extractWaitSeconds(['run', '--wait=0']), undefined)
-    assert.equal(extractWaitSeconds(['run', '--wait=']), undefined)
-    assert.equal(extractWaitSeconds(['run', '--wait', '-5']), undefined)
+  it('ignores other solgrid lines, garbage and empty text', () => {
+    assert.equal(parseRunReport('solgrid: update available 0.7.0\n'), undefined)
+    assert.equal(parseRunReport('Error: nope\n'), undefined)
+    assert.equal(parseRunReport(''), undefined)
   })
+})
 
-  it('reads wait budgets across interleaved global options like the CLI', () => {
-    // `--wait --lang en 600`: the root program strips `--lang en`, so --wait consumes 600.
-    assert.equal(extractWaitSeconds(['run', '-p', 'x', '-e', 'y', '--wait', '--lang', 'en', '600', '--json']), 600)
-    assert.equal(extractWaitSeconds(['run', '--wait', '--lang', 'en', 'abc']), undefined)
-    assert.equal(extractWaitSeconds(['run', '--lang=en', '--wait', '5']), 5)
-  })
-
-  it('understands combined short groups and rejects values the CLI rejects', () => {
-    assert.equal(extractWaitSeconds(['run', '-jw600']), 600)
-    assert.equal(extractWaitSeconds(['run', '-jw']), 300)
-    assert.equal(extractWaitSeconds(['run', '-wj600']), undefined) // value 'j600': CLI usage error
-    assert.equal(extractWaitSeconds(['run', '-w=30']), undefined) // commander keeps raw '=30'
-    assert.equal(hasOutputOption(['run', '-oout.json']), true)
-    assert.equal(hasOutputOption(['run', '-jo']), true)
-  })
-
-  it('detects output options that imply waiting', () => {
-    assert.equal(hasOutputOption(['run', '-o', 'out.json']), true)
-    assert.equal(hasOutputOption(['run', '--output=out.json']), true)
-    assert.equal(hasOutputOption(['run', '--output', 'out.json']), true)
-    assert.equal(hasOutputOption(['run', '-i', '{"o":"-o"}']), false)
-  })
-
-  it('prepends a generated idempotency key after the subcommand name, unconditionally', () => {
-    const injected = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--wait', '30'])
-    assert.ok(injected.idempotencyKey !== undefined)
-    assert.match(injected.idempotencyKey, /^[0-9a-f-]{36}$/)
-    assert.deepEqual(injected.cliArgs, [
-      'run',
-      '--idempotency-key',
-      injected.idempotencyKey,
-      '-p',
-      'x',
-      '-e',
-      'y',
-      '--wait',
-      '30',
-    ])
-    assert.equal(injected.waitSeconds, 30)
-
-    // after global options, the key lands right after the subcommand name
-    const withLang = prepareRunInvocation(['--lang', 'zh', 'run', '--json'])
-    assert.deepEqual(withLang.cliArgs, ['--lang', 'zh', 'run', '--idempotency-key', withLang.idempotencyKey, '--json'])
-
-    const untouched = prepareRunInvocation(['discover', '-q', 'twitter', '--json'])
-    assert.equal(untouched.idempotencyKey, undefined)
-    assert.deepEqual(untouched.cliArgs, ['discover', '-q', 'twitter', '--json'])
-  })
-
-  it('lets the CLI resolve key precedence: an explicit key always overrides the injected one', () => {
-    // commander last-wins: the agent's later key is the effective one (probed against the CLI)
-    const explicit = prepareRunInvocation(['run', '--idempotency-key', 'mine'])
-    assert.deepEqual(explicit.cliArgs, ['run', '--idempotency-key', explicit.idempotencyKey, '--idempotency-key', 'mine'])
-
-    const lastWins = prepareRunInvocation(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
-    assert.deepEqual(lastWins.cliArgs, [
-      'run',
-      '--idempotency-key',
-      lastWins.idempotencyKey,
-      '--idempotency-key',
-      'old',
-      '--idempotency-key',
-      'actual',
-    ])
-
-    // an explicit empty key stays effective (last) and is rejected by the CLI with USAGE
-    const empty = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
-    assert.deepEqual(empty.cliArgs, ['run', '--idempotency-key', empty.idempotencyKey, '-p', 'x', '-e', 'y', '--idempotency-key', ''])
-
-    // interleaved globals and a -- consumed as -o's value: the agent's key is still last-wins
-    const interleaved = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json'])
-    assert.deepEqual(interleaved.cliArgs.slice(3), ['-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'actual-key', '--json'])
-
-    const round4 = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-o', '--', '--idempotency-key', 'retry-key', '--json'])
-    assert.deepEqual(round4.cliArgs, [
-      'run',
-      '--idempotency-key',
-      round4.idempotencyKey,
-      '-p',
-      'x',
-      '-e',
-      'y',
-      '-o',
-      '--',
-      '--idempotency-key',
-      'retry-key',
-      '--json',
-    ])
-  })
-
-  it('prepends before any -- separator, so the key stays an option', () => {
-    const bare = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--'])
-    assert.deepEqual(bare.cliArgs, ['run', '--idempotency-key', bare.idempotencyKey, '-p', 'x', '-e', 'y', '--'])
-
-    const operands = prepareRunInvocation(['run', '--', 'a', 'b'])
-    assert.deepEqual(operands.cliArgs.slice(0, 3), ['run', '--idempotency-key', operands.idempotencyKey])
-    assert.deepEqual(operands.cliArgs.slice(-3), ['--', 'a', 'b'])
-
-    // -o consumes the -- as its value; the prepended key is still a leading option
-    const consumed = prepareRunInvocation(['run', '-o', '--'])
-    assert.deepEqual(consumed.cliArgs, ['run', '--idempotency-key', consumed.idempotencyKey, '-o', '--'])
-  })
-
-  it('applies the -o implied wait with combined shorts and help-as-value', () => {
-    const attached = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-oout.json'])
-    assert.equal(attached.waitSeconds, 300)
-
-    const combined = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-jw600'])
-    assert.equal(combined.waitSeconds, 600)
-
-    const helpAsValue = prepareRunInvocation(['run', '-o', '--help'])
-    assert.ok(helpAsValue.idempotencyKey !== undefined)
-    assert.equal(helpAsValue.waitSeconds, 300)
-  })
-
-  it('extends the timeout to cover declared wait budgets and clamps below setTimeout overflow', () => {
+describe('resolveTimeoutMs', () => {
+  it('extends to cover reported wait budgets and clamps below setTimeout overflow', () => {
     assert.equal(resolveTimeoutMs(1_000, undefined), 1_000)
     assert.equal(resolveTimeoutMs(1_000, 30), 45_000)
     assert.equal(resolveTimeoutMs(120_000, 30), 120_000)
-    assert.equal(resolveTimeoutMs(300, 1e9), 2_147_483_000) // --wait=1000000000s would overflow
-    assert.equal(resolveTimeoutMs(1e15, undefined), 2_147_483_000) // absurd requested timeout
+    assert.equal(resolveTimeoutMs(300, 1e9), 2_147_483_000)
+    assert.equal(resolveTimeoutMs(1e15, undefined), 2_147_483_000)
   })
+})
 
+describe('extractRunId', () => {
   it('extracts run IDs from partial JSON or text output', () => {
     const id = '01a21090-8ab3-70b1-bd3a-3b83768f0741'
     assert.equal(extractRunId(`{"runId":"${id}"}`), id)
@@ -356,14 +216,23 @@ describe('run invocation preparation', () => {
     assert.equal(extractRunId('Run submitted.'), undefined)
     assert.equal(extractRunId(''), undefined)
   })
+})
 
-  it('builds WAIT_TIMEOUT notices naming the key and recovery commands', () => {
-    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: undefined })
+describe('buildTimeoutNotice', () => {
+  it('reports the exact key without caveats when the CLI reported it', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', exact: true })
     assert.ok(notice !== undefined)
     assert.match(notice, /WAIT_TIMEOUT/)
-    assert.match(notice, /idempotencyKey: key-1 \(auto-injected by this tool\)/)
+    assert.match(notice, /idempotencyKey: key-1/)
     assert.match(notice, /runs get --idempotency-key key-1 --wait --json/)
-    assert.match(notice, /its last occurrence is the effective key/)
+    assert.doesNotMatch(notice, /last occurrence/)
+  })
+
+  it('falls back to the preset key with guidance when nothing was reported', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1' })
+    assert.ok(notice !== undefined)
+    assert.match(notice, /idempotencyKey: key-1/)
+    assert.match(notice, /its last occurrence/)
     assert.match(notice, /NOT_FOUND/)
 
     const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: 'abc' })
@@ -524,69 +393,71 @@ describe('solgrid plugin integration', () => {
     }
   })
 
-  it('returns timeout status when command exceeds timeoutMs', async () => {
+  it('returns timeout status without a recovery notice for non-run commands', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
       const res = await tools[0].execute({ args: ['sleep', '10000'], timeoutMs: 150 }, makeExec())
       assert.equal(res.status, 'timeout')
-      assert.equal(res.hint, undefined) // non-run commands get no recovery notice
+      assert.equal(res.hint, undefined)
     } finally {
       dispose()
     }
   })
 
-  it('prepends the injected idempotency key right after the subcommand name', async () => {
-    const { ctx, tools, dispose } = createMockCtx()
-    applyWithCli(ctx, {}, resolved)
-    try {
-      const res = await tools[0].execute({ args: ['run', '-p', 'x', '-e', 'y', '--json'] }, makeExec())
-      assert.equal(res.status, 'ok')
-      const parsed = JSON.parse(res.stdout)
-      assert.equal(parsed.args[0], 'run')
-      assert.equal(parsed.args[1], '--idempotency-key')
-      assert.match(parsed.args[2], /^[0-9a-f-]{36}$/)
-      assert.deepEqual(parsed.args.slice(3), ['-p', 'x', '-e', 'y', '--json'])
-    } finally {
-      dispose()
-    }
-  })
-
-  it('leaves an explicit key in place — the CLI last-wins resolves it over the injected one', async () => {
+  it('presets the key via env and never modifies the arguments', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
       const res = await tools[0].execute(
-        { args: ['run', '--idempotency-key', 'agent-key-1'] },
+        { args: ['run', '-p', 'x', '-e', 'y', '--json'] },
         makeExec(),
       )
       assert.equal(res.status, 'ok')
       const parsed = JSON.parse(res.stdout)
-      assert.equal(parsed.args[0], 'run')
-      assert.equal(parsed.args[1], '--idempotency-key')
-      assert.match(parsed.args[2], /^[0-9a-f-]{36}$/)
-      assert.deepEqual(parsed.args.slice(3), ['--idempotency-key', 'agent-key-1'])
+      assert.deepEqual(parsed.args, ['run', '-p', 'x', '-e', 'y', '--json']) // argv untouched
+      assert.match(parsed.key, /^[0-9a-f-]{36}$/) // the CLI reports the preset env key
     } finally {
       dispose()
     }
   })
 
-  it('extends the effective timeout to cover a declared --wait budget', async () => {
+  it('lets an explicit --idempotency-key win over the preset env key', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
-      // Mock finishes ~1.3s in; without extension the 200ms tool timeout would kill it first.
       const res = await tools[0].execute(
-        { args: ['run', '--wait', '1'], timeoutMs: 200 },
+        { args: ['run', '--idempotency-key', 'agent-key-1', '--json'] },
         makeExec(),
       )
       assert.equal(res.status, 'ok')
+      const parsed = JSON.parse(res.stdout)
+      assert.deepEqual(parsed.args, ['run', '--idempotency-key', 'agent-key-1', '--json'])
+      assert.equal(parsed.key, 'agent-key-1')
     } finally {
       dispose()
     }
   })
 
-  it('returns a WAIT_TIMEOUT recovery hint when a run is cut off by the tool timeout', async () => {
+  it('re-arms the timeout when the CLI reports a wait budget', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // Mock finishes ~1.3s in; without the re-arm the 200ms safety net would kill it first.
+      const res = await tools[0].execute({ args: ['run', '--wait', '1'], timeoutMs: 200 }, makeExec())
+      assert.equal(res.status, 'ok')
+
+      const lookup = await tools[0].execute(
+        { args: ['runs', 'get', '-r', 'run_01', '--wait', '1'], timeoutMs: 200 },
+        makeExec(),
+      )
+      assert.equal(lookup.status, 'ok')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('returns an exact recovery hint naming the reported key when a run is killed', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
@@ -594,9 +465,11 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'timeout')
       assert.equal(res.exitCode, 1)
       assert.equal(res.stdout, '')
+      assert.match(res.stderr, /^solgrid: idempotencyKey=[0-9a-f-]{36}$/)
       assert.match(res.hint, /WAIT_TIMEOUT/)
       assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36}/)
       assert.match(res.hint, /runs get --idempotency-key [0-9a-f-]{36} --wait --json/)
+      assert.doesNotMatch(res.hint, /last occurrence/) // reported key: exact, no caveats
 
       const rendered = tools[0].output.render({ args: ['run', '--hang'] }, res)
       assert.match(rendered[0].text, /status: timeout/)
@@ -606,49 +479,19 @@ describe('solgrid plugin integration', () => {
     }
   })
 
-  it('names a caller-provided idempotency key in the timeout hint', async () => {
+  it('names an explicitly passed key exactly in the timeout hint', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
-      // The hint names the injected key and points at the command's own key when present —
-      // the CLI resolves agent-key-2 as the effective key via last-wins.
+      // The CLI resolves the flag over the preset env key and reports it — even killed, the
+      // hint is exact (flag > env > generated, resolved by the CLI itself).
       const res = await tools[0].execute(
         { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
         makeExec(),
       )
       assert.equal(res.status, 'timeout')
-      assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36} \(auto-injected by this tool\)/)
-      assert.match(res.hint, /its last occurrence is the effective key/)
-    } finally {
-      dispose()
-    }
-  })
-
-  it('recovers runs whose global options interleave or whose -- is a value', async () => {
-    // Round-3 and round-4 shapes: the injected key leads, the agent's key stays effective.
-    const { ctx, tools, dispose } = createMockCtx()
-    applyWithCli(ctx, {}, resolved)
-    try {
-      const interleaved = await tools[0].execute(
-        {
-          args: ['run', '-p', 'x', '-e', 'y', '--idempotency-key', '--lang', 'en', 'agent-key-3', '--hang'],
-          timeoutMs: 150,
-        },
-        makeExec(),
-      )
-      assert.equal(interleaved.status, 'timeout')
-      assert.match(interleaved.hint, /idempotencyKey: [0-9a-f-]{36}/)
-      assert.match(interleaved.hint, /its last occurrence is the effective key/)
-
-      const asValue = await tools[0].execute(
-        {
-          args: ['run', '-p', '--', '-e', 'y', '--idempotency-key', 'agent-key-4', '--hang'],
-          timeoutMs: 150,
-        },
-        makeExec(),
-      )
-      assert.equal(asValue.status, 'timeout')
-      assert.match(asValue.hint, /idempotencyKey: [0-9a-f-]{36}/)
+      assert.match(res.hint, /idempotencyKey: agent-key-2/)
+      assert.doesNotMatch(res.hint, /last occurrence/)
     } finally {
       dispose()
     }

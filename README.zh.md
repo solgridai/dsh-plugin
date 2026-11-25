@@ -54,11 +54,11 @@ dsh plugin --profile web add github:solgridai/dsh-plugin
     maxOutputChars: 200000               # 可选：stdout/stderr 截断上限（默认 200000）
 ```
 
-超时采用分层设计，付费 run 不会因硬杀而丢失：
+超时采用分层设计，付费 run 不会因硬杀而丢失（基于捆绑的 `@solgridai/cli` 0.7.0+ 包装器协议）：
 
-- 声明了 `--wait <秒>` 的命令（含 `-o <文件>` 隐含的等待）至少会拿到该时长加一段富余，让 CLI 自己报出 `WAIT_TIMEOUT`（带 runId、idempotency key 和恢复命令），工具超时不会先到。
-- 每次 `run` 会自动注入 `--idempotency-key`（除非你显式传入），因此即使残余的硬超时也会返回恢复提示：`solgrid runs get --idempotency-key <key> --wait --json` 可找回该 run，用同一 key 重跑也不会重复扣费。
-- `defaultTimeoutMs` / 工具参数 `timeoutMs` 仅作为防挂死的安全网（下载、网络卡住等）。
+- 每次 `run` 通过 `SOLGRID_IDEMPOTENCY_KEY` 预置幂等键——显式传入的 `--idempotency-key` 始终优先，插件不会修改任何参数。
+- CLI 在提交前向 stderr 输出一行 `solgrid: idempotencyKey=<key> wait=<秒>`。stderr 不受 `--json` 缓冲影响，即使被 SIGKILL 也会留存。插件据此对齐自己的超时与等待预算（agent 看到的是 CLI 原生的 `WAIT_TIMEOUT`，含 run ID、key 与恢复命令）；若必须中途停止 CLI，则据此给出精确 key 的恢复提示。
+- `defaultTimeoutMs` / 工具参数 `timeoutMs` 仅作为防挂死安全网（下载、网络卡住等）。
 
 ## 开发与检查
 

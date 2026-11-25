@@ -29,8 +29,9 @@ On your first use, the agent will display a Solgrid authorization link and short
 
 ## Timeouts & billing safety
 
-Paid runs keep running (and get billed) on Solgrid even if the local CLI is stopped, so the plugin never lets a timeout silently lose track of one:
+Paid runs keep running (and get billed) on Solgrid even if the local CLI is stopped, so the plugin never lets a timeout silently lose track of one. It uses the wrapper protocol of the bundled `@solgridai/cli` 0.7.0+:
 
-- A declared `--wait <seconds>` budget (or the wait implied by `-o`) always wins over the tool timeout: the effective limit is extended to the wait plus a grace margin, and the CLI itself returns a `WAIT_TIMEOUT` error naming the run ID, the idempotency key and the follow-up command.
-- Every `run` receives an auto-injected `--idempotency-key`, so even a residual hard timeout returns a recovery hint. Follow it with `runs get --idempotency-key <key> --wait` to fetch the finished run, or re-run the same command with that key — Solgrid returns the existing run instead of charging a second one.
+- A `run` without an explicit `--idempotency-key` uses a key the plugin presets via `SOLGRID_IDEMPOTENCY_KEY`; the flag always wins, so agent-chosen keys keep their retry semantics.
+- Before submitting, the CLI writes `solgrid: idempotencyKey=<key> wait=<seconds>` to stderr. That line is the recovery anchor: it survives even a SIGKILL (stderr is never buffered), and it names the CLI's own resolved key — exact whether it came from the flag, the environment, or generation.
+- On seeing the line, the plugin aligns its timeout with the reported wait budget, so the CLI's own `WAIT_TIMEOUT` (run ID, key, follow-up commands) is what the agent reads. If the plugin must still kill the process, the hint names the reported key: follow it with `runs get --idempotency-key <key> --wait` to fetch the finished run, or re-run the same command — Solgrid returns the existing run instead of charging a second one.
 - The remaining timeout (`defaultTimeoutMs`, `timeoutMs`) is a safety net against hung processes such as long downloads, not a deadline for in-flight runs.

@@ -56,10 +56,10 @@ You can also configure the plugin in your profile's `cordis.patch.yml`:
     maxOutputChars: 200000               # optional stdout/stderr truncation cap (default: 200000)
 ```
 
-Timeouts are layered so paid runs are never lost to a hard kill:
+Timeouts are layered so paid runs are never lost to a hard kill (via the bundled `@solgridai/cli` 0.7.0+ wrapper protocol):
 
-- Commands declaring `--wait <seconds>` (including the wait implied by `-o <file>`) always receive at least that long plus a grace margin, so the CLI reports its own `WAIT_TIMEOUT` — run ID, idempotency key and recovery commands included — before the tool timeout applies.
-- Every `run` gets an `--idempotency-key` injected automatically (unless you pass one), so even a residual hard timeout returns a recovery hint: `solgrid runs get --idempotency-key <key> --wait --json` fetches the run, and re-running with the same key never double-bills.
+- Every `run` gets an idempotency key preset through `SOLGRID_IDEMPOTENCY_KEY` — an explicit `--idempotency-key` always wins, and the plugin never modifies the arguments.
+- The CLI prints `solgrid: idempotencyKey=<key> wait=<seconds>` to stderr before submitting. stderr is not buffered by `--json` mode, so the line survives even a SIGKILL. The plugin reads it to align its timeout with the wait budget — the CLI's own `WAIT_TIMEOUT`, with run ID, key and recovery commands, is what the agent sees — and to name the exact key in a recovery hint when it must stop the CLI mid-run.
 - `defaultTimeoutMs` / the tool's `timeoutMs` remain as a safety net against hung processes (downloads, network stalls).
 
 ## Development

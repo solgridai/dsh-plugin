@@ -27,187 +27,33 @@ const DEFAULT_TIMEOUT_MS = 300_000
 const DEFAULT_LOGIN_BANNER_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_OUTPUT_CHARS = 200_000
 const SIGKILL_GRACE_MS = 2_000
-/** Mirrors the CLI's own default for a bare `--wait` flag. */
-const DEFAULT_WAIT_SECONDS = 300
-/** Extra headroom above a declared `--wait` budget so the CLI's own WAIT_TIMEOUT fires first. */
+/** Extra headroom above a CLI-reported wait budget so the CLI's own WAIT_TIMEOUT fires first. */
 const WAIT_GRACE_MS = 15_000
 /** setTimeout() overflows above 2^31-1 ms (Node fires such timers after ~1ms); clamp well below. */
 const MAX_TIMEOUT_MS = 2_147_483_000
-/** Long options that require a value; commander consumes the next token unconditionally. */
-const LONG_VALUE_OPTIONS = new Set([
-  '--lang',
-  '--input',
-  '--input-file',
-  '--query',
-  '--path',
-  '--provider',
-  '--endpoint',
-  '--output',
-  '--skill',
-  '--idempotency-key',
-  '--run-id',
-  '--limit',
-  '--cursor',
-])
-/** Short options that take a value; `w` (`--wait`) is optional-valued, the rest required. */
-const SHORT_VALUE_OPTIONS = new Set(['i', 'f', 'p', 'e', 'o', 'r', 'l', 'q', 'k', 's', 'w'])
 
 /**
- * @param {string} token
- * @returns {boolean}
+ * Parse the CLI's stderr report line — `solgrid: idempotencyKey=<key> wait=<seconds>` — written
+ * by `run` and `runs get --wait` before any network I/O. stderr is not buffered by `--json`, so
+ * the line survives a SIGKILL at any point, carrying the CLI's own resolved key and wait budget.
+ * @param {string} text accumulated stderr text
+ * @returns {{ idempotencyKey: string | undefined, waitSeconds: number | undefined } | undefined}
  */
-function isOptionLike(token) {
-  return token.length > 1 && token[0] === '-'
-}
-
-/**
- * @param {string} token
- * @returns {boolean}
- */
-function isNegativeNumber(token) {
-  return /^-(\d+|\d*\.\d+)(e[+-]?\d+)?$/.test(token)
-}
-
-/**
- * Strip root-level (global) options the way the CLI's commander program parses them: `--lang <code>`
- * (its value is consumed unconditionally, even when option-like), `--lang=<code>`, and
- * `-v`/`--version` are extracted from anywhere until the `--` separator. At `--`, stripping stops
- * and the separator plus everything after it pass through verbatim — the subcommand scanner then
- * decides whether that `--` is an option's value (e.g. `run -o --`) or a real separator. Every kept
- * token carries its original index.
- * @param {readonly string[]} args
- * @returns {{ text: string, index: number }[]}
- */
-export function localTokens(args) {
-  /** @type {Array<{ text: string, index: number }>} */
-  const tokens = []
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
-    if (token === '--') {
-      for (let j = i; j < args.length; j++) tokens.push({ text: args[j], index: j })
-      return tokens
-    }
-    if (token === '--lang') {
-      i++ // commander consumes the next token unconditionally as the language code
-      continue
-    }
-    if (token.startsWith('--lang=')) continue
-    if (token === '--version' || token === '-v') continue
-    tokens.push({ text: token, index: i })
-  }
-  return tokens
-}
-
-/**
- * Scan CLI arguments the way the CLI's commander setup parses them, yielding one occurrence per
- * tracked option: root-level global options are stripped first (see `localTokens`), then long
- * `--name value` / `--name=value`, short groups `-abc` where the first value-taking char consumes
- * the rest of the token as its raw value (no `=` stripping), two-token shorts, and the `--`
- * separator (yielded as name `'--'`, after which scanning stops). Every occurrence carries the
- * index of its option token in the original arguments. Repeated options yield repeatedly —
- * commander keeps the LAST assignment, so callers must too.
- * @param {readonly string[]} args
- * @yields {{ name: string, value: string | null, index: number }}
- */
-export function* scanOptionOccurrences(args) {
-  if (!Array.isArray(args)) return
-  const tokens = localTokens(args)
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i].text
-    const index = tokens[i].index
-    if (token === '--') {
-      yield { name: '--', value: null, index }
-      return // everything after -- is an operand
-    }
-    if (token.startsWith('--')) {
-      const eq = token.indexOf('=')
-      if (eq !== -1) {
-        yield { name: token.slice(0, eq), value: token.slice(eq + 1), index }
-        continue
-      }
-      if (LONG_VALUE_OPTIONS.has(token)) {
-        const next = tokens[i + 1] // commander consumes the next token unconditionally
-        if (next !== undefined) i++
-        yield { name: token, value: next !== undefined ? next.text : null, index }
-      } else if (token === '--wait') {
-        const next = tokens[i + 1]
-        if (next !== undefined && (!isOptionLike(next.text) || isNegativeNumber(next.text))) {
-          i++
-          yield { name: token, value: next.text, index }
-        } else {
-          yield { name: token, value: null, index } // bare flag
-        }
-      } else {
-        yield { name: token, value: null, index } // boolean flag
-      }
-      continue
-    }
-    if (isOptionLike(token)) {
-      let rest = token.slice(1)
-      while (rest !== '') {
-        const char = rest[0]
-        rest = rest.slice(1)
-        if (!SHORT_VALUE_OPTIONS.has(char)) {
-          yield { name: `-${char}`, value: null, index } // boolean (or unknown; the CLI will reject it)
-          continue
-        }
-        if (rest !== '') {
-          yield { name: `-${char}`, value: rest, index } // attached value, kept raw like commander
-        } else {
-          const next = tokens[i + 1]
-          const takes =
-            char === 'w'
-              ? next !== undefined && (!isOptionLike(next.text) || isNegativeNumber(next.text))
-              : next !== undefined
-          if (takes) {
-            i++
-            yield { name: `-${char}`, value: next !== undefined ? next.text : null, index }
-          } else {
-            yield { name: `-${char}`, value: null, index }
-          }
-        }
-        break // a value-taking char ends the group
-      }
-      continue
-    }
-    // operand (subcommand name or stray value): nothing to track
-  }
-}
-
-/**
- * Return true when the arguments request help through an actual `--help`/`-h` option occurrence.
- * A `--help`/`-h` string that is merely another option's value (e.g. `run -o --help` uses it as
- * the output file name) does not count.
- * @param {readonly string[]} args
- * @returns {boolean}
- */
-export function hasHelpRequest(args) {
-  for (const occ of scanOptionOccurrences(args)) {
-    if (occ.name === '--help' || occ.name === '-h') return true
-  }
-  return false
-}
-
-/**
- * Return the last occurrence of any of `names`, mirroring commander's last-wins assignment.
- * @param {readonly string[]} args
- * @param {readonly string[]} names
- * @returns {{ name: string, value: string | null } | undefined}
- */
-function lastOption(args, names) {
-  /** @type {{ name: string, value: string | null } | undefined} */
-  let last
-  for (const occ of scanOptionOccurrences(args)) {
-    if (names.includes(occ.name)) last = occ
-  }
-  return last
+export function parseRunReport(text) {
+  if (!text) return undefined
+  const line = text.match(/^solgrid: [^\r\n]*/m)?.[0]
+  if (line === undefined) return undefined
+  const idempotencyKey = line.match(/(?:^|\s)idempotencyKey=(\S+)/)?.[1]
+  const waitSeconds = line.match(/(?:^|\s)wait=(\d+)/)?.[1]
+  if (idempotencyKey === undefined && waitSeconds === undefined) return undefined
+  return { idempotencyKey, waitSeconds: waitSeconds !== undefined ? Number(waitSeconds) : undefined }
 }
 
 const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use the built-in \`solgrid\` tool instead of running \`solgrid\` through \`bash\`. Pass CLI arguments as the \`args\` array (for example \`{ "args": ["discover", "-q", "twitter user profile", "--json"] }\`). The CLI is bundled with this plugin, so no separate installation is needed.
 >
 > For device-code login, call \`solgrid\` with \`{ "args": ["login", "--json"] }\`: it returns the authorization link and code immediately while polling in the background. Relay the link and code to the user; once they approve in their browser, run \`{ "args": ["whoami", "--json"] }\` or re-run the command that failed.
 >
-> Timeouts on paid runs: every \`run\` gets an \`--idempotency-key\` injected automatically, and the tool extends its own timeout to cover a declared \`--wait\` budget, so the CLI itself can report \`WAIT_TIMEOUT\` with the run ID and key. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
+> Timeouts on paid runs: every \`run\` gets an idempotency key preset via \`SOLGRID_IDEMPOTENCY_KEY\` (an explicit \`--idempotency-key\` in \`args\` always wins), and the CLI reports \`solgrid: idempotencyKey=<key> wait=<seconds>\` on stderr before submitting, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
 >
 > To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
 
@@ -330,45 +176,43 @@ export function parseSkillMarkdown(raw) {
 }
 
 /**
- * Return the subcommand token (the first positional) with its index, after global options are
- * stripped, e.g. `--lang zh run ...` resolves to `run` at its original position.
+ * Return the first positional token (the CLI subcommand), skipping root-level global options
+ * (`--lang <code>`, `--lang=<code>`, `-v`, `--version`) that may precede it.
  * @param {readonly string[]} args
- * @returns {{ text: string, index: number } | undefined}
+ * @returns {string | undefined}
  */
-export function subcommandPosition(args) {
+export function firstPositionalCommand(args) {
   if (!Array.isArray(args)) return undefined
-  for (const { text, index } of localTokens(args)) {
-    if (!text.startsWith('-')) return { text, index }
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '--lang') {
+      i++ // skip the option value
+      continue
+    }
+    if (token.startsWith('--lang=')) continue
+    if (token === '--version' || token === '-v') continue
+    if (token.startsWith('-')) continue
+    return token
   }
   return undefined
 }
 
 /**
- * Return the first positional token (the CLI subcommand), or undefined.
- * @param {readonly string[]} args
- * @returns {string | undefined}
- */
-export function firstPositionalCommand(args) {
-  return subcommandPosition(args)?.text
-}
-
-/**
- * Return true when CLI arguments invoke the interactive `login` flow (excluding help requests).
- * Handles global options such as `--lang zh login --json` or `--lang=zh login`.
+ * Return true when CLI arguments invoke the interactive `login` flow. Handles global options
+ * such as `--lang zh login --json` or `--lang=zh login`. A `login --help` routed here is
+ * harmless: the CLI prints its help and exits immediately.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function isLoginCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
-  if (hasHelpRequest(args)) return false
   return firstPositionalCommand(args) === 'login'
 }
 
 /**
- * Return true when CLI arguments invoke the paid `run` command. No help exclusion: prepending a
- * key into `run --help` is harmless (help exits before any submission), while skipping a real
- * run on a misread help flag (e.g. `run -o --help`, where --help is a file name) would lose the
- * recovery key entirely.
+ * Return true when CLI arguments invoke the paid `run` command — the only one that reads
+ * SOLGRID_IDEMPOTENCY_KEY. `run --help` counts too: help exits before any submission, and the
+ * preset value is inert when it does.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
@@ -378,59 +222,26 @@ export function isRunCommand(args) {
 }
 
 /**
- * Extract the effective `--wait` budget in seconds (last occurrence wins, like the CLI).
- * Handles `--wait 30`, `--wait=30`, `-w 30`, `-w30`, bare `--wait` (default 300) and combined short
- * groups like `-jw600`. Best-effort: a non-numeric value or an undetected spelling only lowers the
- * timeout floor — the injected idempotency key keeps the run recoverable either way.
+ * Build the child process environment: plugin config overrides plus, for `run` invocations, a
+ * freshly generated SOLGRID_IDEMPOTENCY_KEY. The CLI prefers an explicit `--idempotency-key`,
+ * then this value, then its own random key — so the plugin never touches the arguments, and the
+ * key it preset is the effective one exactly when the caller passed none.
+ * @param {PluginConfig} config
  * @param {readonly string[]} args
- * @returns {number | undefined}
+ * @param {NodeJS.ProcessEnv} [baseEnv]
+ * @returns {NodeJS.ProcessEnv}
  */
-export function extractWaitSeconds(args) {
-  const occ = lastOption(args, ['--wait', '-w'])
-  if (occ === undefined) return undefined
-  if (occ.value === null) return DEFAULT_WAIT_SECONDS
-  // Mirror the CLI's parsePositiveInt exactly: Number() conversion with an integer/positivity
-  // check, so `600.0`, `6e2` or `0x254` are accepted precisely like the CLI accepts them.
-  const parsed = Number(occ.value)
-  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined
+export function buildRunEnv(config, args, baseEnv = process.env) {
+  const env = buildCliEnv(config, baseEnv)
+  if (isRunCommand(args)) env.SOLGRID_IDEMPOTENCY_KEY = randomUUID()
+  return env
 }
 
 /**
- * Return true when the arguments contain an output-file option (`-o`/`--output`, including
- * attached forms like `-oout.json`), which implies `--wait`.
- * @param {readonly string[]} args
- * @returns {boolean}
- */
-export function hasOutputOption(args) {
-  return lastOption(args, ['-o', '--output']) !== undefined
-}
-
-/**
- * Prepare CLI arguments for execution: `run` commands get a freshly generated `--idempotency-key`
- * PREPENDED right after the subcommand name, unconditionally. The CLI resolves repeated keys by
- * last-wins, so an explicit key later in the command always overrides ours — "inject only when
- * absent" implemented by the CLI's own parser instead of a plugin-side reimplementation. An
- * explicit empty key likewise stays effective and is rejected with USAGE, exactly as without us.
- * Also reports the effective wait budget (declared, or implied by `-o`), best-effort.
- * @param {readonly string[]} args
- * @returns {{ cliArgs: readonly string[], idempotencyKey: string | undefined, waitSeconds: number | undefined }}
- */
-export function prepareRunInvocation(args) {
-  const waitSeconds = extractWaitSeconds(args)
-  if (!isRunCommand(args)) {
-    return { cliArgs: args, idempotencyKey: undefined, waitSeconds }
-  }
-  const idempotencyKey = randomUUID()
-  const at = subcommandPosition(args)?.index ?? 0
-  const cliArgs = [...args.slice(0, at + 1), '--idempotency-key', idempotencyKey, ...args.slice(at + 1)]
-  const implied = hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined
-  return { cliArgs, idempotencyKey, waitSeconds: waitSeconds ?? implied }
-}
-
-/**
- * Compute the effective subprocess timeout: never below the requested value, but extended to cover a
- * declared `--wait` budget plus a grace margin, so the CLI's own WAIT_TIMEOUT (with run ID, key and
- * recovery hints) is returned instead of a hard kill. Clamped below the setTimeout overflow limit.
+ * Compute the effective subprocess timeout: never below the requested value, but extended to
+ * cover a reported wait budget plus a grace margin, so the CLI's own WAIT_TIMEOUT (with run ID,
+ * key and recovery hints) fires instead of a hard kill. Clamped below the setTimeout overflow
+ * limit.
  * @param {number} requestedMs
  * @param {number | undefined} waitSeconds
  * @returns {number}
@@ -455,13 +266,13 @@ export function extractRunId(output) {
 
 /**
  * Build a WAIT_TIMEOUT-style recovery notice for a `run` cut off by the tool-level timeout,
- * mirroring the CLI's own error contract (idempotency key, run ID, follow-up commands). The key
- * is the one this tool prepended; when the command carried its own --idempotency-key, that key
- * (its last occurrence) is the effective one and the notice says so.
- * @param {{ timeoutMs: number, idempotencyKey: string | undefined, runId?: string | undefined }} info
+ * mirroring the CLI's own error contract. `idempotencyKey` is the CLI's *reported* key when
+ * available (exact: the CLI resolved flag/env/generated itself before being killed); otherwise
+ * the key this tool preset via SOLGRID_IDEMPOTENCY_KEY, with guidance for the flag case.
+ * @param {{ timeoutMs: number, idempotencyKey: string | undefined, runId?: string | undefined, exact?: boolean }} info
  * @returns {string | undefined}
  */
-export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
+export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId, exact }) {
   if (idempotencyKey === undefined && runId === undefined) return undefined
   const seconds = Math.max(1, Math.round(timeoutMs / 1000))
   /** @type {string[]} */
@@ -474,11 +285,15 @@ export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
   }
   if (idempotencyKey !== undefined) {
     lines.push(
-      `idempotencyKey: ${idempotencyKey} (auto-injected by this tool)`,
+      `idempotencyKey: ${idempotencyKey}`,
       `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
-      'If the command passed its own --idempotency-key, its last occurrence is the effective key — use that one instead.',
-      'A NOT_FOUND answer means nothing was accepted; re-running the identical command is then safe.',
     )
+    if (exact !== true) {
+      lines.push(
+        'If the command passed its own --idempotency-key, that key (its last occurrence) is the effective one — use it instead.',
+        'A NOT_FOUND answer means nothing was accepted; re-running the identical command is then safe.',
+      )
+    }
   }
   return lines.join('\n')
 }
@@ -603,10 +418,12 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
    * @param {string} cwd
    * @param {number} timeoutMs
    * @param {AbortSignal} signal
-   * @param {string} [idempotencyKey] present when the invocation is a paid `run`; enables the WAIT_TIMEOUT recovery notice
+   * @param {NodeJS.ProcessEnv} [env]
+   * @param {string} [injectedRunKey] set for paid `run` invocations (SOLGRID_IDEMPOTENCY_KEY);
+   *   enables the recovery notice when the CLI is killed before reporting
    * @returns {Promise<CliRunResult>}
    */
-  const runCli = (cliArgs, cwd, timeoutMs, signal, idempotencyKey) =>
+  const runCli = (cliArgs, cwd, timeoutMs, signal, env, injectedRunKey) =>
     new Promise((resolve, reject) => {
       if (signal.aborted) {
         reject(createAbortError(signal, 'solgrid command aborted'))
@@ -615,7 +432,7 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
 
       const child = spawn(process.execPath, [cliBin, ...cliArgs], {
         cwd,
-        env: buildCliEnv(config),
+        env: env ?? buildCliEnv(config),
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
@@ -623,6 +440,11 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       let stderr = ''
       let settled = false
       let timedOut = false
+      /** The idempotency key the CLI reported on stderr — its own resolved, exact one. */
+      /** @type {string | undefined} */
+      let reportedKey
+      /** The effective timeout right now; the re-armed value is the one the notice reports. */
+      let currentTimeoutMs = timeoutMs
 
       /** @param {CliRunResult} result */
       const finish = (result) => {
@@ -649,10 +471,33 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
 
       signal.addEventListener('abort', onAbort, { once: true })
 
-      const timer = setTimeout(() => {
+      const onTimeout = () => {
         timedOut = true
         terminateChild(child)
-      }, timeoutMs)
+      }
+      /** @type {ReturnType<typeof setTimeout>} */
+      let timer = setTimeout(onTimeout, currentTimeoutMs)
+
+      /**
+       * The CLI reports `solgrid: idempotencyKey=<key> wait=<seconds>` on stderr before any
+       * network I/O. On arrival: remember the exact effective key, and realign the safety net
+       * with the reported wait budget (only ever extending it) so the CLI's own WAIT_TIMEOUT —
+       * run ID, key and recovery hints included — is what the agent sees, not a hard kill.
+       * @param {string} text accumulated stderr
+       */
+      const onStderr = (text) => {
+        const report = parseRunReport(text)
+        if (report === undefined) return
+        if (report.idempotencyKey !== undefined) reportedKey = report.idempotencyKey
+        if (report.waitSeconds !== undefined && !timedOut) {
+          const next = resolveTimeoutMs(timeoutMs, report.waitSeconds)
+          if (next > currentTimeoutMs) {
+            currentTimeoutMs = next
+            clearTimeout(timer)
+            timer = setTimeout(onTimeout, currentTimeoutMs)
+          }
+        }
+      }
 
       child.stdout.setEncoding('utf8')
       child.stderr.setEncoding('utf8')
@@ -661,12 +506,18 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       })
       child.stderr.on('data', (chunk) => {
         stderr = appendLimited(stderr, chunk, maxOutputChars)
+        onStderr(stderr)
       })
       child.on('error', (err) => fail(err))
       child.on('close', (code) => {
         const hint =
-          timedOut && idempotencyKey !== undefined
-            ? buildTimeoutNotice({ timeoutMs, idempotencyKey, runId: extractRunId(stdout) })
+          timedOut && (reportedKey !== undefined || injectedRunKey !== undefined)
+            ? buildTimeoutNotice({
+                timeoutMs: currentTimeoutMs,
+                idempotencyKey: reportedKey ?? injectedRunKey,
+                runId: extractRunId(stdout),
+                exact: reportedKey !== undefined,
+              })
             : undefined
         finish({
           status: timedOut ? 'timeout' : code === 0 ? 'ok' : 'error',
@@ -793,9 +644,9 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
         timeoutMs: {
           type: 'integer',
           description:
-            `Optional positive timeout in milliseconds (defaults to ${defaultTimeoutMs}). Treated as a lower bound for ` +
-            'commands with `--wait <seconds>`: the effective timeout is extended to cover the wait plus a margin, ' +
-            'so the CLI can return its own WAIT_TIMEOUT with the run ID and idempotency key. Ignored for `login`, ' +
+            `Optional positive timeout in milliseconds (defaults to ${defaultTimeoutMs}); a hang safety net. ` +
+            'Commands that wait (run/runs get with --wait, or -o) report their wait budget on stderr, and this ' +
+            'timeout is extended to cover it, so the CLI reports its own WAIT_TIMEOUT first. Ignored for `login`, ' +
             'which returns the code immediately and polls in the background.',
         },
       },
@@ -853,9 +704,10 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
         if (isLoginCommand(args.args)) {
           return await startLogin(args.args, cwd, exec.signal)
         }
-        const { cliArgs, idempotencyKey, waitSeconds } = prepareRunInvocation(args.args)
-        const timeoutMs = resolveTimeoutMs(args.timeoutMs ?? defaultTimeoutMs, waitSeconds)
-        return await runCli(cliArgs, cwd, timeoutMs, exec.signal, idempotencyKey)
+        const env = buildRunEnv(config, args.args)
+        const injectedRunKey = env.SOLGRID_IDEMPOTENCY_KEY
+        const timeoutMs = args.timeoutMs ?? defaultTimeoutMs
+        return await runCli(args.args, cwd, timeoutMs, exec.signal, env, injectedRunKey)
       },
       presentCall: (args) => ({
         card: 'generic',

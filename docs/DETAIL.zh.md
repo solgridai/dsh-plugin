@@ -29,8 +29,9 @@
 
 ## 超时与计费安全
 
-付费 run 提交后即使本地 CLI 被停止，也会继续在 Solgrid 侧运行并计费，因此插件不会让超时静默丢失一次 run：
+付费 run 提交后即使本地 CLI 被停止，也会继续在 Solgrid 侧运行并计费，因此插件不会让超时静默丢失一次 run。它使用捆绑的 `@solgridai/cli` 0.7.0+ 的包装器协议：
 
-- 声明的 `--wait <秒>`（含 `-o` 隐含的等待）始终优先于工具超时：有效超时会延长到该时长加富余，由 CLI 自己返回 `WAIT_TIMEOUT`，其中带有 run ID、idempotency key 和后续命令。
-- 每次 `run` 都会自动注入 `--idempotency-key`，即使残余的硬超时也会返回恢复提示。按提示执行 `runs get --idempotency-key <key> --wait` 即可取回已完成的 run，或用同一 key 重跑同一命令——Solgrid 会返回已有 run，不会二次扣费。
+- 未显式传 `--idempotency-key` 的 `run` 使用插件通过 `SOLGRID_IDEMPOTENCY_KEY` 预置的 key；显式参数始终优先，agent 自己的 key 保持原有重试语义。
+- 提交前，CLI 会向 stderr 写一行 `solgrid: idempotencyKey=<key> wait=<秒>`。这一行就是恢复锚点：stderr 不受缓冲，即使 SIGKILL 也会留存，且记录的是 CLI 自己解析出的最终 key——无论它来自显式参数、环境变量还是自动生成，都精确无误。
+- 插件收到该行后会把自身超时对齐到报告的等待预算，agent 读到的是 CLI 原生的 `WAIT_TIMEOUT`（含 run ID、key 和后续命令）。若插件仍不得不杀掉进程，提示里给出报告的 key：按它执行 `runs get --idempotency-key <key> --wait` 即可取回已完成的 run，或用同一 key 重跑同一命令——Solgrid 会返回已有 run，不会二次扣费。
 - 其余超时（`defaultTimeoutMs`、`timeoutMs`）仅是防挂死安全网（如大文件下载），不是对进行中 run 的截止时间。
