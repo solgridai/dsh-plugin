@@ -31,6 +31,8 @@ const SIGKILL_GRACE_MS = 2_000
 const DEFAULT_WAIT_SECONDS = 300
 /** Extra headroom above a declared `--wait` budget so the CLI's own WAIT_TIMEOUT fires first. */
 const WAIT_GRACE_MS = 15_000
+/** setTimeout() overflows above 2^31-1 ms (Node fires such timers after ~1ms); clamp well below. */
+const MAX_TIMEOUT_MS = 2_147_483_000
 /** Long options that require a value; commander consumes the next token unconditionally. */
 const LONG_VALUE_OPTIONS = new Set([
   '--lang',
@@ -70,36 +72,40 @@ function isNegativeNumber(token) {
  * Scan CLI arguments the way the CLI's commander setup parses them, yielding one occurrence per
  * tracked option: long `--name value` / `--name=value`, short groups `-abc` where the first
  * value-taking char consumes the rest of the token as its raw value (no `=` stripping),
- * two-token shorts, and the `--` separator. Repeated options yield repeatedly — commander keeps
- * the LAST assignment, so callers must too.
+ * two-token shorts, and the `--` separator (yielded as name `'--'`, after which scanning stops).
+ * Every occurrence carries the index of its option token. Repeated options yield repeatedly —
+ * commander keeps the LAST assignment, so callers must too.
  * @param {readonly string[]} args
- * @yields {{ name: string, value: string | null }}
+ * @yields {{ name: string, value: string | null, index: number }}
  */
 export function* scanOptionOccurrences(args) {
   if (!Array.isArray(args)) return
   for (let i = 0; i < args.length; i++) {
     const token = args[i]
-    if (token === '--') return // everything after -- is an operand
+    if (token === '--') {
+      yield { name: '--', value: null, index: i }
+      return // everything after -- is an operand
+    }
     if (token.startsWith('--')) {
       const eq = token.indexOf('=')
       if (eq !== -1) {
-        yield { name: token.slice(0, eq), value: token.slice(eq + 1) }
+        yield { name: token.slice(0, eq), value: token.slice(eq + 1), index: i }
         continue
       }
       if (LONG_VALUE_OPTIONS.has(token)) {
         const next = args[i + 1] // commander consumes the next token unconditionally
         if (next !== undefined) i++
-        yield { name: token, value: next !== undefined ? next : null }
+        yield { name: token, value: next !== undefined ? next : null, index: i }
       } else if (token === '--wait') {
         const next = args[i + 1]
         if (next !== undefined && (!isOptionLike(next) || isNegativeNumber(next))) {
           i++
-          yield { name: token, value: next }
+          yield { name: token, value: next, index: i }
         } else {
-          yield { name: token, value: null } // bare flag
+          yield { name: token, value: null, index: i } // bare flag
         }
       } else {
-        yield { name: token, value: null } // boolean flag
+        yield { name: token, value: null, index: i } // boolean flag
       }
       continue
     }
@@ -109,11 +115,11 @@ export function* scanOptionOccurrences(args) {
         const char = rest[0]
         rest = rest.slice(1)
         if (!SHORT_VALUE_OPTIONS.has(char)) {
-          yield { name: `-${char}`, value: null } // boolean (or unknown; the CLI will reject it)
+          yield { name: `-${char}`, value: null, index: i } // boolean (or unknown; the CLI will reject it)
           continue
         }
         if (rest !== '') {
-          yield { name: `-${char}`, value: rest } // attached value, kept raw like commander
+          yield { name: `-${char}`, value: rest, index: i } // attached value, kept raw like commander
         } else {
           const next = args[i + 1]
           const takes =
@@ -122,9 +128,9 @@ export function* scanOptionOccurrences(args) {
               : next !== undefined
           if (takes) {
             i++
-            yield { name: `-${char}`, value: next }
+            yield { name: `-${char}`, value: next, index: i }
           } else {
-            yield { name: `-${char}`, value: null }
+            yield { name: `-${char}`, value: null, index: i }
           }
         }
         break // a value-taking char ends the group
@@ -133,6 +139,33 @@ export function* scanOptionOccurrences(args) {
     }
     // operand (subcommand name or stray value): nothing to track
   }
+}
+
+/**
+ * Return the index of the `--` operand separator, or -1. A `--` consumed as another option's
+ * value (e.g. `run -o --`) does not count as a separator.
+ * @param {readonly string[]} args
+ * @returns {number}
+ */
+export function separatorIndex(args) {
+  for (const occ of scanOptionOccurrences(args)) {
+    if (occ.name === '--') return occ.index
+  }
+  return -1
+}
+
+/**
+ * Return true when the arguments request help through an actual `--help`/`-h` option occurrence.
+ * A `--help`/`-h` string that is merely another option's value (e.g. `run -o --help` uses it as
+ * the output file name) does not count.
+ * @param {readonly string[]} args
+ * @returns {boolean}
+ */
+export function hasHelpRequest(args) {
+  for (const occ of scanOptionOccurrences(args)) {
+    if (occ.name === '--help' || occ.name === '-h') return true
+  }
+  return false
 }
 
 /**
@@ -296,25 +329,25 @@ export function firstPositionalCommand(args) {
 }
 
 /**
- * Return true when CLI arguments invoke the interactive `login` flow (excluding `--help`).
+ * Return true when CLI arguments invoke the interactive `login` flow (excluding help requests).
  * Handles global options such as `--lang zh login --json` or `--lang=zh login`.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function isLoginCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
-  if (args.includes('--help') || args.includes('-h')) return false
+  if (hasHelpRequest(args)) return false
   return firstPositionalCommand(args) === 'login'
 }
 
 /**
- * Return true when CLI arguments invoke the paid `run` command (excluding `--help`).
+ * Return true when CLI arguments invoke the paid `run` command (excluding help requests).
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function isRunCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
-  if (args.includes('--help') || args.includes('-h')) return false
+  if (hasHelpRequest(args)) return false
   return firstPositionalCommand(args) === 'run'
 }
 
@@ -343,7 +376,10 @@ export function extractWaitSeconds(args) {
   const occ = lastOption(args, ['--wait', '-w'])
   if (occ === undefined) return undefined
   if (occ.value === null) return DEFAULT_WAIT_SECONDS
-  return /^\d+$/.test(occ.value) ? Number(occ.value) : undefined
+  // Mirror the CLI's parsePositiveInt exactly: Number() conversion with an integer/positivity
+  // check, so `600.0`, `6e2` or `0x254` are accepted precisely like the CLI accepts them.
+  const parsed = Number(occ.value)
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined
 }
 
 /**
@@ -376,20 +412,27 @@ export function prepareRunInvocation(args) {
     return { cliArgs: args, idempotencyKey: existing === null ? undefined : existing, waitSeconds }
   }
   const idempotencyKey = randomUUID()
-  return { cliArgs: [...args, '--idempotency-key', idempotencyKey], idempotencyKey, waitSeconds }
+  // Insert before the `--` operand separator (a trailing option would land among the operands
+  // and make the CLI fail with "too many arguments"); append at the end otherwise.
+  const at = separatorIndex(args) === -1 ? args.length : separatorIndex(args)
+  return {
+    cliArgs: [...args.slice(0, at), '--idempotency-key', idempotencyKey, ...args.slice(at)],
+    idempotencyKey,
+    waitSeconds,
+  }
 }
 
 /**
  * Compute the effective subprocess timeout: never below the requested value, but extended to cover a
  * declared `--wait` budget plus a grace margin, so the CLI's own WAIT_TIMEOUT (with run ID, key and
- * recovery hints) is returned instead of a hard kill.
+ * recovery hints) is returned instead of a hard kill. Clamped below the setTimeout overflow limit.
  * @param {number} requestedMs
  * @param {number | undefined} waitSeconds
  * @returns {number}
  */
 export function resolveTimeoutMs(requestedMs, waitSeconds) {
-  if (waitSeconds === undefined) return requestedMs
-  return Math.max(requestedMs, waitSeconds * 1000 + WAIT_GRACE_MS)
+  if (waitSeconds === undefined) return Math.min(requestedMs, MAX_TIMEOUT_MS)
+  return Math.min(Math.max(requestedMs, waitSeconds * 1000 + WAIT_GRACE_MS), MAX_TIMEOUT_MS)
 }
 
 /**

@@ -14,12 +14,14 @@ import {
   extractRunId,
   extractWaitSeconds,
   firstPositionalCommand,
+  hasHelpRequest,
   hasOutputOption,
   isLoginCommand,
   isRunCommand,
   parseSkillMarkdown,
   prepareRunInvocation,
   resolveTimeoutMs,
+  separatorIndex,
 } from '../index.js'
 
 const mockCliPath = fileURLToPath(new URL('./fixtures/mock-cli.js', import.meta.url))
@@ -159,6 +161,31 @@ describe('run invocation preparation', () => {
     assert.equal(isRunCommand([]), false)
   })
 
+  it('detects help requests only as real option occurrences, not as values', () => {
+    assert.equal(hasHelpRequest(['run', '--help']), true)
+    assert.equal(hasHelpRequest(['run', '-h']), true)
+    assert.equal(hasHelpRequest(['run', '-ho']), true) // -h flag followed by -o
+    assert.equal(hasHelpRequest(['run', '-o', '--help']), false) // output file named "--help"
+    assert.equal(hasHelpRequest(['run', '--output', '--help']), false)
+    assert.equal(hasHelpRequest(['run', '--idempotency-key', '--help']), false) // key named "--help"
+    assert.equal(hasHelpRequest(['run', '-i', '-h']), false)
+    assert.equal(hasHelpRequest(['run', '--', '--help']), false) // operand after separator
+  })
+
+  it('treats runs whose --help is merely a value as paid runs', () => {
+    assert.equal(isRunCommand(['run', '-o', '--help']), true)
+    assert.equal(isRunCommand(['run', '--idempotency-key', '--help']), true)
+    assert.equal(isRunCommand(['run', '--help']), false)
+    assert.equal(isRunCommand(['run', '-h']), false)
+  })
+
+  it('finds separator positions, skipping -- consumed as values', () => {
+    assert.equal(separatorIndex(['run', '-p', 'x', '--', 'operand']), 3)
+    assert.equal(separatorIndex(['run', '-o', '--']), -1) // -- is the output file name
+    assert.equal(separatorIndex(['run', '--wait', '--']), 2)
+    assert.equal(separatorIndex(['run']), -1)
+  })
+
   it('extracts explicit idempotency keys in both spellings, last occurrence wins', () => {
     assert.equal(extractIdempotencyKey(['run', '--idempotency-key', 'k1']), 'k1')
     assert.equal(extractIdempotencyKey(['run', '--idempotency-key=k2']), 'k2')
@@ -194,6 +221,17 @@ describe('run invocation preparation', () => {
     // a numeric value of another option must not be misread
     assert.equal(extractWaitSeconds(['run', '-i', '{"wait":"--wait 9"}']), undefined)
     assert.equal(extractWaitSeconds(['run', '--', '--wait', '9']), undefined)
+  })
+
+  it('parses wait numbers exactly like the CLI parsePositiveInt', () => {
+    assert.equal(extractWaitSeconds(['run', '--wait=600.0']), 600)
+    assert.equal(extractWaitSeconds(['run', '--wait=6e2']), 600)
+    assert.equal(extractWaitSeconds(['run', '--wait', '600.0']), 600)
+    assert.equal(extractWaitSeconds(['run', '--wait=0x254']), 596)
+    assert.equal(extractWaitSeconds(['run', '--wait=abc']), undefined)
+    assert.equal(extractWaitSeconds(['run', '--wait=0']), undefined)
+    assert.equal(extractWaitSeconds(['run', '--wait=']), undefined)
+    assert.equal(extractWaitSeconds(['run', '--wait', '-5']), undefined)
   })
 
   it('understands combined short groups and rejects values the CLI rejects', () => {
@@ -253,12 +291,35 @@ describe('run invocation preparation', () => {
 
     const combined = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-jw600'])
     assert.equal(combined.waitSeconds, 600)
+
+    const helpAsValue = prepareRunInvocation(['run', '-o', '--help'])
+    assert.ok(helpAsValue.idempotencyKey !== undefined)
+    assert.equal(helpAsValue.waitSeconds, 300)
   })
 
-  it('extends the timeout to cover declared wait budgets', () => {
+  it('inserts the injected key before the -- separator, never after it', () => {
+    const bare = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--'])
+    assert.ok(bare.idempotencyKey !== undefined)
+    assert.deepEqual(bare.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key', bare.idempotencyKey, '--'])
+
+    const operands = prepareRunInvocation(['run', '--', 'a', 'b'])
+    assert.deepEqual(
+      operands.cliArgs.slice(0, 3),
+      ['run', '--idempotency-key', operands.idempotencyKey],
+    )
+    assert.deepEqual(operands.cliArgs.slice(-3), ['--', 'a', 'b'])
+
+    // a -- consumed as another option's value is not a separator: append at the end
+    const consumed = prepareRunInvocation(['run', '-o', '--'])
+    assert.deepEqual(consumed.cliArgs, ['run', '-o', '--', '--idempotency-key', consumed.idempotencyKey])
+  })
+
+  it('extends the timeout to cover declared wait budgets and clamps below setTimeout overflow', () => {
     assert.equal(resolveTimeoutMs(1_000, undefined), 1_000)
     assert.equal(resolveTimeoutMs(1_000, 30), 45_000)
     assert.equal(resolveTimeoutMs(120_000, 30), 120_000)
+    assert.equal(resolveTimeoutMs(300, 1e9), 2_147_483_000) // --wait=1000000000s would overflow
+    assert.equal(resolveTimeoutMs(1e15, undefined), 2_147_483_000) // absurd requested timeout
   })
 
   it('extracts run IDs from partial JSON or text output', () => {
