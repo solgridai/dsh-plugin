@@ -31,7 +31,7 @@ if (cmd === 'sleep') {
     process.exit(0)
   }, ms)
 } else if (cmd === 'run' || (cmd === 'runs' && args[1] === 'get')) {
-  // Key resolution: explicit flag, then the preset env, then generated.
+  // Key resolution: explicit flag, then a generated key — reported on stderr as JSON before work.
   let key
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--idempotency-key') {
@@ -43,7 +43,7 @@ if (cmd === 'sleep') {
       break
     }
   }
-  key = key ?? process.env.SOLGRID_IDEMPOTENCY_KEY ?? 'mock-generated-key'
+  key = key ?? 'mock-generated-key'
 
   /** @type {number | undefined} */
   let wait
@@ -64,16 +64,21 @@ if (cmd === 'sleep') {
     console.log(JSON.stringify({ args }))
     process.exit(0)
   }
-  process.stderr.write(`solgrid: ${JSON.stringify(report)}\n`)
-
-  if (args.includes('--hang')) {
+  if (args.includes('--silent-hang')) {
+    // Hang without reporting: simulates the CLI being killed before it writes the report line
+    // (and thus before any submission — nothing to recover).
     setTimeout(() => process.exit(0), 60_000)
   } else {
-    const delay = wait !== undefined ? wait * 1000 + 300 : 0
-    setTimeout(() => {
-      console.log(JSON.stringify({ args, ...(cmd === 'run' ? { key, wait: wait ?? null } : {}) }))
-      process.exit(0)
-    }, delay)
+    process.stderr.write(`solgrid: ${JSON.stringify(report)}\n`)
+    if (args.includes('--hang')) {
+      setTimeout(() => process.exit(0), 60_000)
+    } else {
+      const delay = wait !== undefined ? wait * 1000 + 300 : 0
+      setTimeout(() => {
+        console.log(JSON.stringify({ args, ...(cmd === 'run' ? { key, wait: wait ?? null } : {}) }))
+        process.exit(0)
+      }, delay)
+    }
   }
 } else if (cmd === 'login') {
   if (args.includes('--fail')) {

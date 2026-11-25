@@ -8,7 +8,7 @@ import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import {
   applyWithCli,
   buildCliEnv,
-  buildRunEnv,
+  buildNotReportedNotice,
   buildTimeoutNotice,
   createAbortError,
   extractRunId,
@@ -153,26 +153,25 @@ describe('command detection', () => {
   })
 })
 
-describe('buildRunEnv', () => {
-  it('presets SOLGRID_IDEMPOTENCY_KEY only for run invocations', () => {
-    const runEnv = buildRunEnv({}, ['run', '-p', 'x', '-e', 'y'], {})
-    assert.ok(runEnv.SOLGRID_IDEMPOTENCY_KEY !== undefined)
-    assert.match(runEnv.SOLGRID_IDEMPOTENCY_KEY, /^[0-9a-f-]{36}$/)
-    assert.equal(runEnv.ELECTRON_RUN_AS_NODE, '1')
+describe('timeout notices', () => {
+  it('reports the exact key the CLI reported, without caveats', () => {
+    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'job wait=1' })
+    assert.match(notice, /WAIT_TIMEOUT/)
+    assert.match(notice, /idempotencyKey: job wait=1/)
+    assert.match(notice, /runs get --idempotency-key job wait=1 --wait --json/)
+    assert.doesNotMatch(notice, /last occurrence/)
 
-    const otherEnv = buildRunEnv({}, ['discover', '-q', 'twitter'], {})
-    assert.equal(otherEnv.SOLGRID_IDEMPOTENCY_KEY, undefined)
-
-    const first = buildRunEnv({}, ['run'], {}).SOLGRID_IDEMPOTENCY_KEY
-    const second = buildRunEnv({}, ['run'], {}).SOLGRID_IDEMPOTENCY_KEY
-    assert.ok(first !== undefined && second !== undefined)
-    assert.notEqual(first, second)
+    const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'k', runId: 'abc' })
+    assert.match(withRunId, /runId: abc/)
+    assert.match(withRunId, /runs get -r abc --wait --json/)
   })
 
-  it('carries config overrides and never touches the argument list', () => {
-    const env = buildRunEnv({ apiBaseUrl: 'https://api.example', lang: 'zh' }, ['run'], {})
-    assert.equal(env.SOLGRID_API_BASE_URL, 'https://api.example')
-    assert.equal(env.SOLGRID_LANG, 'zh')
+  it('says nothing was submitted when the CLI was killed before reporting', () => {
+    const notice = buildNotReportedNotice(1_000)
+    assert.match(notice, /WAIT_TIMEOUT/)
+    assert.match(notice, /before it reported its idempotency key/)
+    assert.match(notice, /no run was started/)
+    assert.match(notice, /re-running the identical command is safe/)
   })
 })
 
@@ -224,32 +223,6 @@ describe('extractRunId', () => {
     assert.equal(extractRunId(`Run ID:  ${id}`), id)
     assert.equal(extractRunId('Run submitted.'), undefined)
     assert.equal(extractRunId(''), undefined)
-  })
-})
-
-describe('buildTimeoutNotice', () => {
-  it('reports the exact key without caveats when the CLI reported it', () => {
-    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', exact: true })
-    assert.ok(notice !== undefined)
-    assert.match(notice, /WAIT_TIMEOUT/)
-    assert.match(notice, /idempotencyKey: key-1/)
-    assert.match(notice, /runs get --idempotency-key key-1 --wait --json/)
-    assert.doesNotMatch(notice, /last occurrence/)
-  })
-
-  it('falls back to the preset key with guidance when nothing was reported', () => {
-    const notice = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1' })
-    assert.ok(notice !== undefined)
-    assert.match(notice, /idempotencyKey: key-1/)
-    assert.match(notice, /its last occurrence/)
-    assert.match(notice, /NOT_FOUND/)
-
-    const withRunId = buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: 'key-1', runId: 'abc' })
-    assert.ok(withRunId !== undefined)
-    assert.match(withRunId, /runId: abc/)
-    assert.match(withRunId, /runs get -r abc --wait --json/)
-
-    assert.equal(buildTimeoutNotice({ timeoutMs: 1_000, idempotencyKey: undefined }), undefined)
   })
 })
 
@@ -414,7 +387,7 @@ describe('solgrid plugin integration', () => {
     }
   })
 
-  it('presets the key via env and never modifies the arguments', async () => {
+  it('passes arguments through verbatim and echoes the generated key', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
@@ -425,13 +398,13 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'ok')
       const parsed = JSON.parse(res.stdout)
       assert.deepEqual(parsed.args, ['run', '-p', 'x', '-e', 'y', '--json']) // argv untouched
-      assert.match(parsed.key, /^[0-9a-f-]{36}$/) // the CLI reports the preset env key
+      assert.equal(parsed.key, 'mock-generated-key') // the CLI generated and reported it
     } finally {
       dispose()
     }
   })
 
-  it('lets an explicit --idempotency-key win over the preset env key', async () => {
+  it('reports an explicit --idempotency-key as the resolved key', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
@@ -474,10 +447,10 @@ describe('solgrid plugin integration', () => {
       assert.equal(res.status, 'timeout')
       assert.equal(res.exitCode, 1)
       assert.equal(res.stdout, '')
-      assert.match(res.stderr, /^solgrid: \{"idempotencyKey":"[0-9a-f-]{36}"\}$/)
+      assert.match(res.stderr, /^solgrid: \{"idempotencyKey":"mock-generated-key"\}$/)
       assert.match(res.hint, /WAIT_TIMEOUT/)
-      assert.match(res.hint, /idempotencyKey: [0-9a-f-]{36}/)
-      assert.match(res.hint, /runs get --idempotency-key [0-9a-f-]{36} --wait --json/)
+      assert.match(res.hint, /idempotencyKey: mock-generated-key/)
+      assert.match(res.hint, /runs get --idempotency-key mock-generated-key --wait --json/)
       assert.doesNotMatch(res.hint, /last occurrence/) // reported key: exact, no caveats
 
       const rendered = tools[0].output.render({ args: ['run', '--hang'] }, res)
@@ -488,13 +461,32 @@ describe('solgrid plugin integration', () => {
     }
   })
 
+  it('says nothing was submitted when killed before the CLI reported', async () => {
+    const { ctx, tools, dispose } = createMockCtx()
+    applyWithCli(ctx, {}, resolved)
+    try {
+      // --silent-hang: the child hangs before writing the report line — by protocol, before
+      // any submission — so the recovery notice must say re-running is safe, without a key.
+      const res = await tools[0].execute(
+        { args: ['run', '--silent-hang'], timeoutMs: 150 },
+        makeExec(),
+      )
+      assert.equal(res.status, 'timeout')
+      assert.equal(res.stderr, '')
+      assert.match(res.hint, /before it reported its idempotency key/)
+      assert.match(res.hint, /no run was started/)
+      assert.doesNotMatch(res.hint, /idempotencyKey: /)
+    } finally {
+      dispose()
+    }
+  })
+
   it('names an explicitly passed key exactly in the timeout hint', async () => {
     const { ctx, tools, dispose } = createMockCtx()
     applyWithCli(ctx, {}, resolved)
     try {
-      // The CLI resolves the flag over the preset env key and reports it — even killed, the
-      // hint is exact (flag > env > generated, resolved by the CLI itself). Keys containing
-      // spaces round-trip losslessly through the JSON report line.
+      // The CLI resolves and reports the key itself; even killed, the hint is exact.
+      // Keys containing spaces round-trip losslessly through the JSON report line.
       const res = await tools[0].execute(
         { args: ['run', '--hang', '--idempotency-key', 'agent-key-2'], timeoutMs: 150 },
         makeExec(),

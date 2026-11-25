@@ -9,7 +9,6 @@
  */
 
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -64,7 +63,7 @@ const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use t
 >
 > For device-code login, call \`solgrid\` with \`{ "args": ["login", "--json"] }\`: it returns the authorization link and code immediately while polling in the background. Relay the link and code to the user; once they approve in their browser, run \`{ "args": ["whoami", "--json"] }\` or re-run the command that failed.
 >
-> Timeouts on paid runs: every \`run\` gets an idempotency key preset via \`SOLGRID_IDEMPOTENCY_KEY\` (an explicit \`--idempotency-key\` in \`args\` always wins), and the CLI reports \`solgrid: {\"idempotencyKey\":\"<key>\",\"wait\":<seconds>}\` on stderr before submitting, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
+> Timeouts on paid runs: before submitting, the CLI reports \`solgrid: {"idempotencyKey":"<key>","wait":<seconds>}\` on stderr, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
 >
 > To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
 
@@ -221,31 +220,14 @@ export function isLoginCommand(args) {
 }
 
 /**
- * Return true when CLI arguments invoke the paid `run` command — the only one that reads
- * SOLGRID_IDEMPOTENCY_KEY. `run --help` counts too: help exits before any submission, and the
- * preset value is inert when it does.
+ * Return true when CLI arguments invoke the paid `run` command — the only one that reports
+ * its idempotency key on stderr. `run --help` counts too: help exits before any submission.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function isRunCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return false
   return firstPositionalCommand(args) === 'run'
-}
-
-/**
- * Build the child process environment: plugin config overrides plus, for `run` invocations, a
- * freshly generated SOLGRID_IDEMPOTENCY_KEY. The CLI prefers an explicit `--idempotency-key`,
- * then this value, then its own random key — so the plugin never touches the arguments, and the
- * key it preset is the effective one exactly when the caller passed none.
- * @param {PluginConfig} config
- * @param {readonly string[]} args
- * @param {NodeJS.ProcessEnv} [baseEnv]
- * @returns {NodeJS.ProcessEnv}
- */
-export function buildRunEnv(config, args, baseEnv = process.env) {
-  const env = buildCliEnv(config, baseEnv)
-  if (isRunCommand(args)) env.SOLGRID_IDEMPOTENCY_KEY = randomUUID()
-  return env
 }
 
 /**
@@ -277,14 +259,12 @@ export function extractRunId(output) {
 
 /**
  * Build a WAIT_TIMEOUT-style recovery notice for a `run` cut off by the tool-level timeout,
- * mirroring the CLI's own error contract. `idempotencyKey` is the CLI's *reported* key when
- * available (exact: the CLI resolved flag/env/generated itself before being killed); otherwise
- * the key this tool preset via SOLGRID_IDEMPOTENCY_KEY, with guidance for the flag case.
- * @param {{ timeoutMs: number, idempotencyKey: string | undefined, runId?: string | undefined, exact?: boolean }} info
- * @returns {string | undefined}
+ * mirroring the CLI's own error contract. `idempotencyKey` is the key the CLI itself reported
+ * on stderr before any network I/O — the exact one it resolved from flag or generation.
+ * @param {{ timeoutMs: number, idempotencyKey: string, runId?: string | undefined }} info
+ * @returns {string}
  */
-export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId, exact }) {
-  if (idempotencyKey === undefined && runId === undefined) return undefined
+export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId }) {
   const seconds = Math.max(1, Math.round(timeoutMs / 1000))
   /** @type {string[]} */
   const lines = [
@@ -294,19 +274,26 @@ export function buildTimeoutNotice({ timeoutMs, idempotencyKey, runId, exact }) 
   if (runId !== undefined) {
     lines.push(`runId: ${runId}`, `Check it with: solgrid runs get -r ${runId} --wait --json`)
   }
-  if (idempotencyKey !== undefined) {
-    lines.push(
-      `idempotencyKey: ${idempotencyKey}`,
-      `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
-    )
-    if (exact !== true) {
-      lines.push(
-        'If the command passed its own --idempotency-key, that key (its last occurrence) is the effective one — use it instead.',
-        'A NOT_FOUND answer means nothing was accepted; re-running the identical command is then safe.',
-      )
-    }
-  }
+  lines.push(
+    `idempotencyKey: ${idempotencyKey}`,
+    `Check it with: solgrid runs get --idempotency-key ${idempotencyKey} --wait --json`,
+  )
   return lines.join('\n')
+}
+
+/**
+ * Build the recovery notice for a `run` killed before the CLI reported its idempotency key.
+ * The CLI writes the report line before any network I/O, so no line means nothing was
+ * submitted: re-running the identical command is safe — no key needed, nothing to lose.
+ * @param {number} timeoutMs
+ * @returns {string}
+ */
+export function buildNotReportedNotice(timeoutMs) {
+  const seconds = Math.max(1, Math.round(timeoutMs / 1000))
+  return [
+    `WAIT_TIMEOUT: the solgrid tool stopped the CLI after ~${seconds}s, before it reported its idempotency key.`,
+    'The CLI reports the key before submitting anything, so no run was started; re-running the identical command is safe.',
+  ].join('\n')
 }
 
 /**
@@ -430,11 +417,10 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
    * @param {number} timeoutMs
    * @param {AbortSignal} signal
    * @param {NodeJS.ProcessEnv} [env]
-   * @param {string} [injectedRunKey] set for paid `run` invocations (SOLGRID_IDEMPOTENCY_KEY);
-   *   enables the recovery notice when the CLI is killed before reporting
+   * @param {boolean} [isRun] true for paid `run` invocations; enables the recovery notices
    * @returns {Promise<CliRunResult>}
    */
-  const runCli = (cliArgs, cwd, timeoutMs, signal, env, injectedRunKey) =>
+  const runCli = (cliArgs, cwd, timeoutMs, signal, env, isRun) =>
     new Promise((resolve, reject) => {
       if (signal.aborted) {
         reject(createAbortError(signal, 'solgrid command aborted'))
@@ -521,15 +507,18 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
       })
       child.on('error', (err) => fail(err))
       child.on('close', (code) => {
-        const hint =
-          timedOut && (reportedKey !== undefined || injectedRunKey !== undefined)
-            ? buildTimeoutNotice({
-                timeoutMs: currentTimeoutMs,
-                idempotencyKey: reportedKey ?? injectedRunKey,
-                runId: extractRunId(stdout),
-                exact: reportedKey !== undefined,
-              })
-            : undefined
+        /** @type {string | undefined} */
+        let hint
+        if (timedOut && isRun) {
+          hint =
+            reportedKey !== undefined
+              ? buildTimeoutNotice({
+                  timeoutMs: currentTimeoutMs,
+                  idempotencyKey: reportedKey,
+                  runId: extractRunId(stdout),
+                })
+              : buildNotReportedNotice(currentTimeoutMs)
+        }
         finish({
           status: timedOut ? 'timeout' : code === 0 ? 'ok' : 'error',
           exitCode: code ?? 1,
@@ -715,10 +704,9 @@ export function applyWithCli(ctx, config = {}, resolved = resolveSolgridCli()) {
         if (isLoginCommand(args.args)) {
           return await startLogin(args.args, cwd, exec.signal)
         }
-        const env = buildRunEnv(config, args.args)
-        const injectedRunKey = env.SOLGRID_IDEMPOTENCY_KEY
+        const isRun = isRunCommand(args.args)
         const timeoutMs = args.timeoutMs ?? defaultTimeoutMs
-        return await runCli(args.args, cwd, timeoutMs, exec.signal, env, injectedRunKey)
+        return await runCli(args.args, cwd, timeoutMs, exec.signal, buildCliEnv(config), isRun)
       },
       presentCall: (args) => ({
         card: 'generic',
