@@ -159,32 +159,56 @@ describe('run invocation preparation', () => {
     assert.equal(isRunCommand([]), false)
   })
 
-  it('extracts explicit idempotency keys in both spellings', () => {
+  it('extracts explicit idempotency keys in both spellings, last occurrence wins', () => {
     assert.equal(extractIdempotencyKey(['run', '--idempotency-key', 'k1']), 'k1')
     assert.equal(extractIdempotencyKey(['run', '--idempotency-key=k2']), 'k2')
+    assert.equal(
+      extractIdempotencyKey(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual']),
+      'actual',
+    )
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=a', '--idempotency-key', 'b']), 'b')
     assert.equal(
       extractIdempotencyKey(['run', '-i', '{"x":"--idempotency-key=trap"}', '--idempotency-key', 'k3']),
       'k3',
     )
+    assert.equal(extractIdempotencyKey(['run', '--', '--idempotency-key', 'k']), undefined)
     assert.equal(extractIdempotencyKey(['discover', '-q', 'twitter']), undefined)
   })
 
-  it('extracts wait budgets in all spellings', () => {
+  it('reports a present-but-empty key as null instead of absent', () => {
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key', '']), null)
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key=']), null)
+    assert.equal(extractIdempotencyKey(['run', '--idempotency-key']), null) // CLI errors: argument missing
+  })
+
+  it('extracts wait budgets in all spellings, last occurrence wins', () => {
     assert.equal(extractWaitSeconds(['run', '--wait', '30']), 30)
     assert.equal(extractWaitSeconds(['run', '--wait=45']), 45)
     assert.equal(extractWaitSeconds(['run', '-w', '60']), 60)
-    assert.equal(extractWaitSeconds(['run', '-w=15']), 15)
     assert.equal(extractWaitSeconds(['run', '-w90']), 90)
     assert.equal(extractWaitSeconds(['run', '--wait']), 300)
+    assert.equal(extractWaitSeconds(['run', '--wait', '--json']), 300) // next token is an option: bare
     assert.equal(extractWaitSeconds(['runs', 'get', '-r', 'abc', '--wait', '5']), 5)
+    assert.equal(extractWaitSeconds(['run', '--wait', '600', '--wait', '30']), 30)
     assert.equal(extractWaitSeconds(['discover']), undefined)
     // a numeric value of another option must not be misread
     assert.equal(extractWaitSeconds(['run', '-i', '{"wait":"--wait 9"}']), undefined)
+    assert.equal(extractWaitSeconds(['run', '--', '--wait', '9']), undefined)
+  })
+
+  it('understands combined short groups and rejects values the CLI rejects', () => {
+    assert.equal(extractWaitSeconds(['run', '-jw600']), 600)
+    assert.equal(extractWaitSeconds(['run', '-jw']), 300)
+    assert.equal(extractWaitSeconds(['run', '-wj600']), undefined) // value 'j600': CLI usage error
+    assert.equal(extractWaitSeconds(['run', '-w=30']), undefined) // commander keeps raw '=30'
+    assert.equal(hasOutputOption(['run', '-oout.json']), true)
+    assert.equal(hasOutputOption(['run', '-jo']), true)
   })
 
   it('detects output options that imply waiting', () => {
     assert.equal(hasOutputOption(['run', '-o', 'out.json']), true)
     assert.equal(hasOutputOption(['run', '--output=out.json']), true)
+    assert.equal(hasOutputOption(['run', '--output', 'out.json']), true)
     assert.equal(hasOutputOption(['run', '-i', '{"o":"-o"}']), false)
   })
 
@@ -200,12 +224,35 @@ describe('run invocation preparation', () => {
     assert.equal(kept.idempotencyKey, 'mine')
     assert.deepEqual(kept.cliArgs, ['run', '--idempotency-key', 'mine'])
 
+    const lastWins = prepareRunInvocation(['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
+    assert.equal(lastWins.idempotencyKey, 'actual')
+    assert.deepEqual(lastWins.cliArgs, ['run', '--idempotency-key', 'old', '--idempotency-key', 'actual'])
+
     const untouched = prepareRunInvocation(['discover', '-q', 'twitter', '--json'])
     assert.equal(untouched.idempotencyKey, undefined)
     assert.deepEqual(untouched.cliArgs, ['discover', '-q', 'twitter', '--json'])
+  })
 
-    const implied = prepareRunInvocation(['run', '-o', 'out.json'])
-    assert.equal(implied.waitSeconds, 300)
+  it('does not replace an explicit empty key — the CLI must reject it untouched', () => {
+    const empty = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
+    assert.equal(empty.idempotencyKey, undefined)
+    assert.deepEqual(empty.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key', ''])
+
+    const trailing = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '--idempotency-key'])
+    assert.equal(trailing.idempotencyKey, undefined)
+    assert.deepEqual(trailing.cliArgs, ['run', '-p', 'x', '-e', 'y', '--idempotency-key'])
+  })
+
+  it('applies the -o implied wait with an explicit key and with combined shorts', () => {
+    const withKey = prepareRunInvocation(['run', '-o', 'out.json', '--idempotency-key', 'known'])
+    assert.equal(withKey.idempotencyKey, 'known')
+    assert.equal(withKey.waitSeconds, 300)
+
+    const attached = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-oout.json'])
+    assert.equal(attached.waitSeconds, 300)
+
+    const combined = prepareRunInvocation(['run', '-p', 'x', '-e', 'y', '-jw600'])
+    assert.equal(combined.waitSeconds, 600)
   })
 
   it('extends the timeout to cover declared wait budgets', () => {

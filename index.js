@@ -31,29 +31,124 @@ const SIGKILL_GRACE_MS = 2_000
 const DEFAULT_WAIT_SECONDS = 300
 /** Extra headroom above a declared `--wait` budget so the CLI's own WAIT_TIMEOUT fires first. */
 const WAIT_GRACE_MS = 15_000
-/** Options that consume the following token as their value; scanned to avoid misreading values as flags. */
-const VALUE_OPTIONS = new Set([
+/** Long options that require a value; commander consumes the next token unconditionally. */
+const LONG_VALUE_OPTIONS = new Set([
   '--lang',
-  '-i',
   '--input',
-  '-f',
   '--input-file',
   '--query',
   '--path',
-  '-p',
   '--provider',
-  '-e',
   '--endpoint',
-  '-o',
   '--output',
   '--skill',
   '--idempotency-key',
-  '-r',
   '--run-id',
-  '-l',
   '--limit',
   '--cursor',
 ])
+/** Short options that take a value; `w` (`--wait`) is optional-valued, the rest required. */
+const SHORT_VALUE_OPTIONS = new Set(['i', 'f', 'p', 'e', 'o', 'r', 'l', 'q', 'k', 's', 'w'])
+
+/**
+ * @param {string} token
+ * @returns {boolean}
+ */
+function isOptionLike(token) {
+  return token.length > 1 && token[0] === '-'
+}
+
+/**
+ * @param {string} token
+ * @returns {boolean}
+ */
+function isNegativeNumber(token) {
+  return /^-(\d+|\d*\.\d+)(e[+-]?\d+)?$/.test(token)
+}
+
+/**
+ * Scan CLI arguments the way the CLI's commander setup parses them, yielding one occurrence per
+ * tracked option: long `--name value` / `--name=value`, short groups `-abc` where the first
+ * value-taking char consumes the rest of the token as its raw value (no `=` stripping),
+ * two-token shorts, and the `--` separator. Repeated options yield repeatedly — commander keeps
+ * the LAST assignment, so callers must too.
+ * @param {readonly string[]} args
+ * @yields {{ name: string, value: string | null }}
+ */
+export function* scanOptionOccurrences(args) {
+  if (!Array.isArray(args)) return
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]
+    if (token === '--') return // everything after -- is an operand
+    if (token.startsWith('--')) {
+      const eq = token.indexOf('=')
+      if (eq !== -1) {
+        yield { name: token.slice(0, eq), value: token.slice(eq + 1) }
+        continue
+      }
+      if (LONG_VALUE_OPTIONS.has(token)) {
+        const next = args[i + 1] // commander consumes the next token unconditionally
+        if (next !== undefined) i++
+        yield { name: token, value: next !== undefined ? next : null }
+      } else if (token === '--wait') {
+        const next = args[i + 1]
+        if (next !== undefined && (!isOptionLike(next) || isNegativeNumber(next))) {
+          i++
+          yield { name: token, value: next }
+        } else {
+          yield { name: token, value: null } // bare flag
+        }
+      } else {
+        yield { name: token, value: null } // boolean flag
+      }
+      continue
+    }
+    if (isOptionLike(token)) {
+      let rest = token.slice(1)
+      while (rest !== '') {
+        const char = rest[0]
+        rest = rest.slice(1)
+        if (!SHORT_VALUE_OPTIONS.has(char)) {
+          yield { name: `-${char}`, value: null } // boolean (or unknown; the CLI will reject it)
+          continue
+        }
+        if (rest !== '') {
+          yield { name: `-${char}`, value: rest } // attached value, kept raw like commander
+        } else {
+          const next = args[i + 1]
+          const takes =
+            char === 'w'
+              ? next !== undefined && (!isOptionLike(next) || isNegativeNumber(next))
+              : next !== undefined
+          if (takes) {
+            i++
+            yield { name: `-${char}`, value: next }
+          } else {
+            yield { name: `-${char}`, value: null }
+          }
+        }
+        break // a value-taking char ends the group
+      }
+      continue
+    }
+    // operand (subcommand name or stray value): nothing to track
+  }
+}
+
+/**
+ * Return the last occurrence of any of `names`, mirroring commander's last-wins assignment.
+ * @param {readonly string[]} args
+ * @param {readonly string[]} names
+ * @returns {{ name: string, value: string | null } | undefined}
+ */
+function lastOption(args, names) {
+  /** @type {{ name: string, value: string | null } | undefined} */
+  let last
+  for (const occ of scanOptionOccurrences(args)) {
+    if (names.includes(occ.name)) last = occ
+  }
+  return last
+}
 
 const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use the built-in \`solgrid\` tool instead of running \`solgrid\` through \`bash\`. Pass CLI arguments as the \`args\` array (for example \`{ "args": ["discover", "-q", "twitter user profile", "--json"] }\`). The CLI is bundled with this plugin, so no separate installation is needed.
 >
@@ -224,87 +319,64 @@ export function isRunCommand(args) {
 }
 
 /**
- * Extract an explicit `--idempotency-key <key>` / `--idempotency-key=<key>` value, if present.
- * Values of other known options are skipped so JSON inputs cannot be misread as flags.
+ * Extract the effective `--idempotency-key` (last occurrence wins, like the CLI).
  * @param {readonly string[]} args
- * @returns {string | undefined}
+ * @returns {string | null | undefined} the key; `null` when present but empty/missing (the CLI
+ *   rejects it with USAGE, so nothing is submitted); `undefined` when not provided at all.
  */
 export function extractIdempotencyKey(args) {
-  if (!Array.isArray(args)) return undefined
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
-    if (token === '--idempotency-key') {
-      const value = args[i + 1]
-      return typeof value === 'string' && value !== '' ? value : undefined
-    }
-    if (token.startsWith('--idempotency-key=')) {
-      const value = token.slice('--idempotency-key='.length)
-      return value !== '' ? value : undefined
-    }
-    if (VALUE_OPTIONS.has(token)) i++ // skip the option value
-  }
-  return undefined
+  const occ = lastOption(args, ['--idempotency-key'])
+  if (occ === undefined) return undefined
+  if (occ.value === null || occ.value === '') return null
+  return occ.value
 }
 
 /**
- * Extract the declared `--wait` budget in seconds (default 300 for a bare `--wait`), if any.
- * Handles `--wait 30`, `--wait=30`, `-w 30`, `-w=30`, and `-w30`.
+ * Extract the effective `--wait` budget in seconds (last occurrence wins, like the CLI).
+ * Handles `--wait 30`, `--wait=30`, `-w 30`, `-w30`, bare `--wait` (default 300) and combined short
+ * groups like `-jw600`. A non-numeric value returns `undefined` — the CLI fails that invocation
+ * with a usage error before submitting anything, so no timeout extension is needed.
  * @param {readonly string[]} args
  * @returns {number | undefined}
  */
 export function extractWaitSeconds(args) {
-  if (!Array.isArray(args)) return undefined
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
-    if (token === '--wait' || token === '-w') {
-      const next = args[i + 1]
-      return typeof next === 'string' && /^\d+$/.test(next) ? Number(next) : DEFAULT_WAIT_SECONDS
-    }
-    if (token.startsWith('--wait=')) {
-      const value = Number(token.slice('--wait='.length))
-      return Number.isFinite(value) && value >= 1 ? value : DEFAULT_WAIT_SECONDS
-    }
-    const short = token.match(/^-w=?(-?\d+)$/)
-    if (short) return Number(short[1])
-    if (VALUE_OPTIONS.has(token)) i++ // skip the option value
-  }
-  return undefined
+  const occ = lastOption(args, ['--wait', '-w'])
+  if (occ === undefined) return undefined
+  if (occ.value === null) return DEFAULT_WAIT_SECONDS
+  return /^\d+$/.test(occ.value) ? Number(occ.value) : undefined
 }
 
 /**
- * Return true when the arguments contain an output-file option (`-o`/`--output`), which implies `--wait`.
+ * Return true when the arguments contain an output-file option (`-o`/`--output`, including
+ * attached forms like `-oout.json`), which implies `--wait`.
  * @param {readonly string[]} args
  * @returns {boolean}
  */
 export function hasOutputOption(args) {
-  if (!Array.isArray(args)) return false
-  for (let i = 0; i < args.length; i++) {
-    const token = args[i]
-    if (token === '-o' || token === '--output' || token.startsWith('--output=')) return true
-    if (VALUE_OPTIONS.has(token)) i++
-  }
-  return false
+  return lastOption(args, ['-o', '--output']) !== undefined
 }
 
 /**
  * Prepare CLI arguments for execution: for `run` commands without an explicit key, append a freshly
  * generated `--idempotency-key` so a tool-level timeout can still point at the exact run (the CLI's
- * own generated key lives only in the child's memory and dies with it). Also reports the effective
- * wait budget (declared, or implied by `-o`).
+ * own generated key lives only in the child's memory and dies with it). A present-but-empty key is
+ * left untouched — the CLI rejects it with USAGE before submitting anything. Also reports the
+ * effective wait budget (declared, or implied by `-o`), computed for every `run` regardless of the
+ * key branch.
  * @param {readonly string[]} args
  * @returns {{ cliArgs: readonly string[], idempotencyKey: string | undefined, waitSeconds: number | undefined }}
  */
 export function prepareRunInvocation(args) {
-  const waitSeconds = extractWaitSeconds(args)
-  if (!isRunCommand(args)) return { cliArgs: args, idempotencyKey: undefined, waitSeconds }
-  const existing = extractIdempotencyKey(args)
-  if (existing !== undefined) return { cliArgs: args, idempotencyKey: existing, waitSeconds }
-  const idempotencyKey = randomUUID()
-  return {
-    cliArgs: [...args, '--idempotency-key', idempotencyKey],
-    idempotencyKey,
-    waitSeconds: waitSeconds ?? (hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined),
+  if (!isRunCommand(args)) {
+    return { cliArgs: args, idempotencyKey: undefined, waitSeconds: extractWaitSeconds(args) }
   }
+  const waitSeconds = extractWaitSeconds(args) ?? (hasOutputOption(args) ? DEFAULT_WAIT_SECONDS : undefined)
+  const existing = extractIdempotencyKey(args)
+  if (existing !== undefined) {
+    return { cliArgs: args, idempotencyKey: existing === null ? undefined : existing, waitSeconds }
+  }
+  const idempotencyKey = randomUUID()
+  return { cliArgs: [...args, '--idempotency-key', idempotencyKey], idempotencyKey, waitSeconds }
 }
 
 /**
