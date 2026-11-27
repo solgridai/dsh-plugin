@@ -87,6 +87,8 @@ const DSH_SKILL_PREAMBLE = `> **DeepSeek Harness (\`dsh\`) runtime note:** Use t
 > Timeouts on paid runs: before submitting, the CLI reports \`solgrid: {"idempotencyKey":"<key>","wait":<seconds>}\` on stderr, so this tool aligns its timeout with the wait budget. If the tool ever returns \`status: "timeout"\` for a \`run\`, its hint names the effective \`idempotencyKey\`: recover the result with \`{ "args": ["runs", "get", "--idempotency-key", "<key>", "--wait", "--json"] }\`, or re-run the same command with \`--idempotency-key <key>\`. Never resubmit with a fresh key — the original run may complete and be billed.
 >
 > To upgrade, update \`@solgridai/dsh-plugin\` from DSH **Plugins** rather than running \`npm install -g @solgridai/cli\`.
+>
+> Language: the CLI accepts a global \`--lang <en|zh>\` option, placeable before or after the subcommand. Pass \`"zh"\` when the user converses in Chinese \u2014 e.g. \`{ "args": ["login", "--lang", "zh", "--json"] }\` \u2014 so the device-code authorization page and server-written text (error messages, tag names) come out in Chinese.
 
 `
 

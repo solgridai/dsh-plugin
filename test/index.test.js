@@ -311,6 +311,9 @@ describe('solgrid plugin integration', () => {
       assert.equal(skills[0].description, 'Find and run third-party tools through Solgrid.')
       assert.match(skills[0].content, /DeepSeek Harness/)
       assert.match(skills[0].content, /Original skill instructions\./)
+      // The guidance QA asked for: the model must know it can pass --lang per call.
+      assert.match(skills[0].content, /--lang <en\|zh>/)
+      assert.match(skills[0].content, /converses in Chinese/)
 
       assert.equal(tools.length, 1)
       assert.equal(tools[0].name, 'solgrid')
